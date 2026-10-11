@@ -27,7 +27,7 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://ai.jojocode.in"
-Source = "https://github.com/persxn/jojocode-tui"
+Source = "https://github.com/persxn/jojoai-tui"
 
 [project.scripts]
 jojo = "jojocode_ai.__main__:main"

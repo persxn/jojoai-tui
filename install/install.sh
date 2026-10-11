@@ -37,7 +37,7 @@ ENDPOINT="${JOJO_ENDPOINT:-https://ai.jojocode.in}"
 PREFIX="${JOJO_PREFIX:-$HOME/.local/share/jojocode-ai}"
 BINDIR="${JOJO_BINDIR:-$HOME/.local/bin}"
 VENV="$PREFIX/venv"
-REPO_PIP='jojocode-ai-tui @ git+https://github.com/persxn/jojocode-tui.git#subdirectory=tui'
+REPO_PIP='jojocode-ai-tui @ git+https://github.com/persxn/jojoai-tui.git#subdirectory=tui'
 
 say()  { printf '%s\n' "$*"; }
 step() { printf '\n\033[1;32m▸ %s\033[0m\n' "$*"; }

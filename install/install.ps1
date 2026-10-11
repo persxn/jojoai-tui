@@ -28,7 +28,7 @@ $Endpoint = if ($env:JOJO_ENDPOINT) { $env:JOJO_ENDPOINT } else { 'https://ai.jo
 $Prefix   = Join-Path $env:LOCALAPPDATA 'jojocode-ai'
 $Venv     = Join-Path $Prefix 'venv'
 $BinDir   = Join-Path $Prefix 'bin'
-$RepoPip  = 'jojocode-ai-tui @ git+https://github.com/persxn/jojocode-tui.git#subdirectory=tui'
+$RepoPip  = 'jojocode-ai-tui @ git+https://github.com/persxn/jojoai-tui.git#subdirectory=tui'
 
 function Step($m) { Write-Host "`n> $m" -ForegroundColor Green }
 function Warn($m) { Write-Host "! $m" -ForegroundColor Yellow }

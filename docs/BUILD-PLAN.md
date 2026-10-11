@@ -10,7 +10,7 @@
 ## Target layout
 
 ```
-jojocode-tui/            (public)
+jojoai-tui/              (public)
   tui/                   Python curses TUI — the JojoCode AI TUI. All platforms
                          (windows-curses on Windows). Two modes:
                            local  — drives your own Ollama directly
