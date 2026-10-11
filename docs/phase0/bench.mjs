@@ -2,7 +2,7 @@
 // Fires N concurrent streaming /api/chat requests, measures per-stream
 // time-to-first-token and eval tok/s, and aggregate throughput.
 //
-//   node phase0/bench.mjs [--host 127.0.0.1:11434] [--model gpt-oss:120b]
+//   node docs/phase0/bench.mjs [--host 127.0.0.1:11434] [--model gpt-oss:120b]
 //        [--levels 1,2,4,8] [--predict 300] [--prompt "..."]
 
 const args = Object.fromEntries(

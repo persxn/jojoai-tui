@@ -6,10 +6,12 @@ own secrets in `.env` (only `.env.example` is in git).
 
 | Path | What | Status |
 |---|---|---|
-| `shared/` | Prisma schema (control-plane DB), the CLI↔backend wire protocol, and two pure libs: `authorize.ts` (the access-decision function) + `rbac.ts` (roles + capabilities) | T2, T10 |
-| `control-plane/` | Always-on `node:http` service: email-OTP login, opaque hashed tokens, `POST /api/authz/check` for the backend. In-memory store (dev/CI) or Prisma (prod) | T10 |
-| `backend/` | host-side WebSocket gateway — auth on connect via the control plane (fail-closed), the server-side orchestrator loop, the Ollama client; seat/queue/idle/reaper next | T11 |
-| `admin/` | Minimal standalone panel: accounts, grants, live sessions, config, audit | T12 |
+| `shared/` | Prisma schema (control-plane DB), the CLI↔backend wire protocol, and two pure libs: `authorize.ts` (the access-decision function) + `rbac.ts` (roles + capabilities). [README](shared/README.md) | T2, T10 |
+| `control-plane/` | Always-on `node:http` service: email-OTP login, opaque hashed tokens, `POST /api/authz/check` for the backend. In-memory store (dev/CI) or Prisma (prod). [README](control-plane/README.md) | T10 |
+| `backend/` | host-side WebSocket gateway — auth on connect via the control plane (fail-closed), the server-side orchestrator loop, the Ollama client; serves the landing page and installers. Seat/queue/idle/reaper next. [README](backend/README.md) | T11 |
+| `scripts/` | `backup-db.sh`, the nightly control-plane database dump. [README](scripts/README.md) | — |
+| `.env.example` | The variables both services read, with placeholders. Copy to `.env` (mode 600, gitignored). | — |
+| *(admin panel)* | Planned, not in the repository yet: accounts, grants, live sessions, config, audit. | T12 |
 
 Auth is email + OTP (no long-lived password), opaque tokens (only the SHA-256 is
 stored), RBAC (`SUPERADMIN` / `ADMIN` / `USER`), and time-boxed access grants

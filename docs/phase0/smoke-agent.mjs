@@ -3,7 +3,7 @@
  * Connects to the WS gateway, drives one coding task, executes the demo tools
  * FOR REAL in a temp project dir (auto-approving), prints the stream.
  *
- *   node phase0/smoke-agent.mjs [--port 7420] [--code jojo-demo] [--task "..."]
+ *   node docs/phase0/smoke-agent.mjs [--port 7420] [--code jojo-demo] [--task "..."]
  */
 import WebSocket from 'ws';
 import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';

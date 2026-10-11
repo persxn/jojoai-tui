@@ -20,6 +20,14 @@ turn?
 The "side effect" in the spike is appending one line to `sideeffect.log`.
 Exactly-once ⇔ that file has exactly one line per tool id, regardless of crashes.
 
+## Files
+
+| File | What |
+|---|---|
+| `server.mjs` | Minimal server-side loop: sessions, a resume window, and replay of unanswered `tool_request`s inside `replay_begin` / `replay_end`. In memory only. |
+| `client.mjs` | The CLI stand-in: runs each tool (appends a line to the side-effect log), journals results by tool id, answers replays from the journal, and can be told to crash before or after executing. |
+| `run.sh` | The harness: starts the server, runs scenarios A–D below, and counts side-effect lines to prove exactly-once. |
+
 ## Run
 
 ```bash

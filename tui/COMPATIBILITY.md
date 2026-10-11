@@ -48,6 +48,37 @@ tool runs instead of its JSON being printed. Ollama too old to report
 capabilities still works: the client learns from its 400 and retries.
 
 A model that cannot think simply does not: `Tab` / `/think` change nothing for it.
+Reasoning a model writes inline in `<think>…</think>` is shown as reasoning
+(hidden with `Ctrl-T`), never as the answer.
+
+The context window comes from the model (`/api/show`) unless `--ctx` sets it;
+old tool output is shortened first when a long session would overflow it, so
+the newest results and the conversation itself survive.
+
+### OpenAI-compatible servers
+
+Any server speaking `/v1/chat/completions` works too: LM Studio, llama.cpp's
+`llama-server`, vLLM, Jan, LocalAI, a hosted API. Point `--host` at a URL ending
+in `/v1` (or pass `--api openai`):
+
+```sh
+jojo --host http://127.0.0.1:1234/v1 --model qwen2.5-coder-7b-instruct
+JOJO_API_KEY=sk-… jojo --host https://api.example.com/v1 --model some-model
+```
+
+Tool calls go through the server's `tools` support when it has it; a server
+that answers a `tools` request with an error (llama-server without `--jinja`,
+a model with no tool template) is switched to the text protocol for the rest
+of the session. `reasoning_content` streams as reasoning. A server that lists a
+single model answers to any `--model`.
+
+## Proxies
+
+`HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` are honoured for the model server,
+web tools and remote mode (the websocket tunnels through the proxy with
+`CONNECT`). A model server on `localhost`, `127.0.0.1` or `::1` is always
+reached directly — a corporate proxy that cannot see your machine's loopback
+used to make a local Ollama unreachable.
 
 ## Scrolling the conversation
 
@@ -71,27 +102,88 @@ terminal's own scrollback instead. While capture is on, hold **Shift** (or
 
 ## Keys
 
-`Ctrl-C` interrupts a running turn (and denies a pending approval); at an idle,
-empty prompt it quits. The TUI runs the terminal in raw mode so Ctrl-C arrives
-as a key — in cbreak mode it was a signal and quit the app mid-turn. Raw mode
-also means `Ctrl-Z` does not suspend and `Ctrl-S`/`Ctrl-Q` are not flow control.
+`Ctrl-C` interrupts a running turn — the model stream and any command it is
+running, process tree included — and denies a pending approval; with text in
+the box it clears it; at an idle, empty prompt it quits. The TUI runs the
+terminal in raw mode so Ctrl-C arrives as a key — in cbreak mode it was a
+signal and quit the app mid-turn. Raw mode also means `Ctrl-Z` does not suspend
+and `Ctrl-S`/`Ctrl-Q` are not flow control.
+
+| Key | Action |
+|---|---|
+| `Enter` | send; while a turn runs, queue the message (it sends when the turn ends) |
+| `Ctrl-A` / `Ctrl-E` | start / end of line |
+| `Ctrl-W` | delete the word before the cursor |
+| `Ctrl-U` / `Ctrl-K` | delete to start / end of line |
+| `Ctrl-Y` | put back what the last delete removed |
+| `↑` / `↓` | move between lines; on the first / last line, walk input history |
+| `Tab` / `Shift-Tab` | cycle reasoning effort |
+| `Ctrl-T` | show / hide reasoning |
+| `Ctrl-R` | chat-history browser |
+| `Ctrl-L` | redraw |
+
+Auto-approve everything is `/yolo` only; no key toggles it, so it cannot be
+switched on by a stray keystroke (`Ctrl-Y` used to). A message that itself
+starts with `/` is sent with `//`; a mistyped command (`/hepl`) is reported,
+not sent to the model, while a path such as `/etc/hosts …` is sent as text.
+
+**Pasting.** Text pasted in one burst keeps its newlines instead of sending at
+the first one. Terminals with bracketed paste (Windows Terminal, iTerm2, most
+Linux terminals) mark the paste exactly; elsewhere, three or more characters
+arriving in one read are treated as a paste. Pasted tabs become four spaces;
+Windows CRLF becomes one newline.
+
+**Approval prompt.** The panel shows the whole request — the full command,
+path and working directory, an edit's old and new text, the first 60 lines of
+a new file's content with the rest counted — with control characters made
+visible (`␊`, `␛`) so nothing can hide after a newline or behind an escape
+sequence. Keys typed in the first moment after it appears are ignored, so a
+keystroke meant for the input box cannot approve it, and a paste never answers
+it. `y` once, `n`/`Esc` deny,
+`a` then `a` again within three seconds to always allow that tool for the
+session; `PgUp`/`PgDn` scroll a long request.
+
+**Auto-approved writes** (`--trust`, or `a` for `write_file` / `edit_file`)
+apply only inside the project directory you started in — not wherever the
+model has since moved with `change_dir` — and never to dot-files or
+dot-directories (`.git`, `.bashrc`, `.env`), nor anywhere when the project is
+your home directory or a filesystem root.
 
 ## Commands the agent runs
 
 `run_bash` runs through the platform shell — `/bin/sh` on Linux and macOS,
 **cmd.exe on Windows** (the system prompt tells the model which). Commands get
 an empty stdin, so anything that waits for keyboard input fails fast instead of
-hanging; a timeout stops the whole process tree, servers it started included.
+hanging; output goes to temporary files, so a command that starts a server in
+the background (`npm run dev &`) returns while the server keeps running. A
+timeout or Ctrl-C stops the whole process tree; quitting stops anything still
+running. Very long output keeps its beginning and end with the middle counted.
 Files are always read and written as UTF-8 and keep their own line endings.
+
+On Windows, two cmd.exe limits are refused before you are asked to approve
+anything, with what to do instead: a multi-line command (cmd.exe would run only
+the first line) and a project on a network (UNC) path (cmd.exe would silently
+run in `C:\Windows`). Commands run without a console window of their own, so
+nothing flashes up or steals the keyboard.
+
+## Files the agent reads and writes
+
+Text is decoded by what it is, not by the locale: a byte-order mark, UTF-16,
+strict UTF-8, then the legacy code page. An edit is written back in the same
+encoding, BOM and line endings, atomically (a crash never leaves half a file),
+keeping its permissions and following symlinks. Binary files are refused
+rather than read as garbage. JojoAI's own settings, credentials and chat
+history are off limits to the tools.
 
 ## Known rough edges
 
-- **Wide characters** (CJK, most emoji) are measured as one column each, so a
-  line full of them can be clipped at the right edge or misalign the right-hand
-  "you" bubble.
-
-- **Paste detection** keeps newlines (instead of submitting) only while a run of
-  ≥2 keystrokes is arriving back-to-back (`< 12 ms` apart). A normal Enter after
-  any pause always sends. Automated drivers should still pause before `Enter`.
+- **Mouse on the classic Windows console.** Mouse capture is off by default in
+  `conhost.exe` (no `WT_SESSION`): capturing it disables QuickEdit, so
+  right-click paste and drag-select stop working, and Shift does not bring them
+  back there. Use `PgUp`/`PgDn`, or `/mouse on` if you prefer the wheel.
+- **Automated drivers** that type character by character should still pause
+  before `Enter` when they mean it as a separate keystroke from the text.
 - macOS Terminal.app has no `curses.init_color`, so the gradient is a 256-colour
   approximation. This is a Terminal.app limitation, not a bug.
+- The header animation stops after 20 s without activity, so an idle session
+  costs no CPU or terminal output (`JOJO_IDLE_ANIMATION=<seconds>` changes it).

@@ -7,8 +7,8 @@
 </p>
 
 <p align="center">
-  <b>Run it fully local</b> against your own Ollama, or point it at a
-  <b>hosted server</b> and keep your laptop light.
+  <b>Run it fully local</b> against your own Ollama or any OpenAI-compatible
+  server, or point it at a <b>hosted server</b> and keep your laptop light.
 </p>
 
 ```
@@ -43,6 +43,11 @@ irm https://ai.jojocode.in/install.ps1 | iex          # Windows (PowerShell)
 jojo                        # in any project directory
 ```
 
+Other model servers (LM Studio, llama.cpp, vLLM, Jan…): `jojo --host
+http://127.0.0.1:1234/v1 --model <name>`. Models without native tool calling
+(qwen2.5-coder, codellama, gemma…) work too — see
+[`tui/COMPATIBILITY.md`](tui/COMPATIBILITY.md).
+
 Or from source:
 
 ```sh
@@ -63,17 +68,35 @@ your machine**, path-jailed to the project, and you approve every destructive on
 
 ## What's in here
 
+Every folder has a `README.md` naming its files and what each one does — start
+from the one nearest the code you are looking at.
+
 ```
-tui/         Python curses client. stdlib-only (windows-curses on Windows).
-             local mode (your Ollama) + remote mode (WebSocket to a server).
-install/     install.sh · install.ps1 · ollama-setup.sh · recommend-model.py
-web/         ai.jojocode.in — one-file landing / docs / live status page
-server/      reference hosted service (self-host):
-  control-plane/   always-on: email-OTP login, opaque tokens, authorize(), audit
-  backend/         WS gateway + agent orchestrator + Ollama client
-  shared/          Prisma schema · wire protocol · authorize() · RBAC
-docs/        ARCHITECTURE.md · BUILD-PLAN.md (full build log) · phase0/ findings
+tui/                         Python curses client (stdlib-only; windows-curses on Windows)
+  jojocode_ai/               the package: UI, agent loop, tools, model + remote clients
+  tests/                     pytest suite (fake model server, real pty)
+install/                     install.sh · install.ps1 · ollama-setup.sh · recommend-model.py (+ their tests)
+web/                         ai.jojocode.in — one-file landing / docs / live status page
+server/                      reference hosted service (self-host)
+  control-plane/src/         always-on: email-OTP login, opaque tokens, authz check, audit
+  backend/src/               WS gateway + agent orchestrator + Ollama client; serves web/ and install/
+  shared/src/                wire protocol · authorize() · RBAC
+  shared/prisma/             control-plane database schema + migrations
+  scripts/                   backup-db.sh
+deploy/                      systemd user units (nightly database backup)
+docs/                        ARCHITECTURE.md · BUILD-PLAN.md · WEB-SEARCH-PLAN.md
+  phase0/                    benchmarks and the exactly-once resume spike
+CLAUDE.md                    working notes for AI agents (and people): modes, traps, conventions
+current_tasks.md             what is in flight right now
 ```
+
+| Looking for… | Read |
+|---|---|
+| Which TUI module does what, and where a symptom starts | [`tui/jojocode_ai/README.md`](tui/jojocode_ai/README.md) |
+| Terminal / platform / model behaviour | [`tui/COMPATIBILITY.md`](tui/COMPATIBILITY.md) |
+| How remote mode works end to end | [`server/backend/src/README.md`](server/backend/src/README.md), [`server/shared/src/README.md`](server/shared/src/README.md) |
+| Sign-in and access decisions | [`server/control-plane/src/README.md`](server/control-plane/src/README.md) |
+| Installing, and publishing a new client | [`install/README.md`](install/README.md), [`tui/README.md`](tui/README.md) |
 
 Full design: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**. Every task and what
 was verified: **[docs/BUILD-PLAN.md](docs/BUILD-PLAN.md)**.

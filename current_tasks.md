@@ -3,6 +3,7 @@
 Status is honest: `done` means verified, not merely written.
 
 Repo: `~/src/jojo-ai` (JojoAI: Python TUI + reference server + landing page).
+Every folder has a README.md listing its files and what each does.
 Related repo: `~/src/JojoCode` (the teaching platform — separate product, shares
 the `jojocode.in` domain and its Brevo mailer).
 
@@ -46,15 +47,64 @@ qwen2.5-coder:7b` and one task that needs a tool.
   chat-history directory; the prompt told Windows to use `python3` and claimed
   there was no internet while offering web search.
 
-### Found, deliberately not changed
-- Remote mode ignores `[a]lways` at the approval prompt (`remote.py` only checks
-  `*`), so it asks every time. Fixing it loosens the approval gate: owner's call.
-- `run_bash` cannot be interrupted mid-command; Ctrl-C lands after it returns.
-- The transcript is re-wrapped in full every frame (~30/s): CPU grows with the
-  length of the chat.
-- Wide characters are counted as one column (layout clipping, not data loss).
-- `/cwd` and `change_dir` do not update the "Working directory" line in the
-  system prompt.
+### Second pass: every bug found, fixed — **tested on Linux; Windows and real models not run**
+A bug hunt over the whole client (164 findings, 155 confirmed by a second,
+adversarial read) and fixes for all of them. What changes for a user:
+
+- **Any model server.** OpenAI-compatible servers (LM Studio, llama.cpp, vLLM,
+  Jan, hosted APIs) via a host ending in `/v1`. Inline `<think>` reasoning is
+  shown as reasoning, not the answer; more text tool-call shapes are run; the
+  context window comes from the model and old tool output is shortened to fit.
+- **Ctrl-C always works**: while the model is silent (interruptible HTTP on a
+  helper thread), during a long command (process tree killed), at the approval
+  prompt. Quitting kills commands still running.
+- **Commands**: output to temp files (background `npm run dev &` returns, a
+  runaway loop cannot fill memory), bounded head/tail. Windows: no console
+  window per command, multi-line commands and UNC directories refused before
+  approval with what to do instead, OEM code-page output decoded.
+- **Files**: encoding detected (BOM, UTF-16, UTF-8, legacy) and preserved on
+  write, mixed line endings preserved, atomic writes that keep permissions and
+  follow symlinks, binary files refused.
+- **Approval**: the panel shows the whole request with control characters made
+  visible; keys in the first 0.35 s ignored, pastes never answer it; "always"
+  takes two presses; `fetch_url` now asks like `web_search` (a URL can carry
+  file contents out);
+  auto-edit limited to the project the user chose, never dot-files, never
+  when the project is `~` or `/`. YOLO is `/yolo` only (`Ctrl-Y` is yank now).
+- **Screen**: display widths (CJK, emoji) right; per-block wrap cache instead
+  of re-wrapping the whole chat every frame; nothing drawn while idle;
+  bracketed paste; messages typed during a turn are queued; mistyped commands
+  are not sent to the model; PDCurses quirks (resize, emoji surrogates, keypad
+  Enter, Shift-arrows, bold shifting colours) handled; mouse off by default in
+  the classic Windows console, where capturing it breaks copy and paste.
+- **Remote mode**: `[a]lways` honoured (the earlier "owner's call" — now
+  consistent with local mode, still two presses); read-only tools decided by
+  the client, unknown tools ask; resume vs fresh session, liveness, interrupt
+  grace, idle seat release; websocket through `HTTPS_PROXY` with CONNECT.
+- **Web tools**: DNS-pinned connections, NAT64/6to4/IPv4-mapped addresses
+  refused, decompressed size capped, a deadline, `start` to page through long
+  pages.
+- **Elsewhere**: `localhost` model servers never sent to a proxy; credentials
+  and history written private (0600) and atomically; recall indexing off the
+  UI thread; `/cwd` and `change_dir` update the system prompt; headless exit
+  codes; `--cwd` validated.
+
+Tests: `tui/tests/` (see its README) — fake Ollama and fake OpenAI servers,
+the curses UI in a real pty, Windows behaviour with `os.name` patched.
+
+**Still not verified, and the first things to do on real machines:**
+1. Windows 10/11, Windows Terminal and classic console: install, one task that
+   edits a file and runs a command, Ctrl-C during that command, paste.
+2. Real weights: `jojo --model qwen2.5-coder:7b`, `--model llama3.1`,
+   `--model gemma2` (text mode), and LM Studio at `http://127.0.0.1:1234/v1`.
+3. Publish the 0.3.0 wheel and update `dist/dl/tui-wheel` (see `tui/README.md`)
+   — until then the installer keeps handing out 0.2.1.
+
+### Server: one fix, not yet deployed
+- `orchestrator.ts` reported a reply cut off by the model's length limit as
+  `stopReason: 'max_wallclock'`, which the TUI shows as the server's time
+  limit. Now `max_tokens` (protocol and client updated; older clients ignore
+  `stopReason`). Live only after the backend is redeployed.
 
 ---
 

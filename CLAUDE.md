@@ -15,36 +15,51 @@ over mail configuration.
 ## Layout
 
 ```
-tui/jojocode_ai/     the Python TUI (the product)
-  tui.py             curses UI (1111 lines — the big one)
+tui/jojocode_ai/     the Python TUI (the product) — module map: tui/jojocode_ai/README.md
+  tui.py             curses UI (the big one)
+  cols.py            display width (CJK = 2), wrapping, making text safe to draw
   agent.py           local agent loop: model → tool_calls → tools → repeat
+  backends.py        picks the model client: Ollama, or OpenAI-compatible (/v1)
   ollama_client.py   /api/chat client; reads model capabilities, shapes `think`
-  toolcalls.py       tool calls a model wrote as TEXT (JSON, fences, tags)
+  openai_client.py   the same interface over /v1/chat/completions (SSE)
+  transport.py       interruptible HTTP for both clients; loopback never proxied
+  toolcalls.py       tool calls a model wrote as TEXT (JSON, fences, tags), <think>
   tools.py           LOCAL tool schemas + implementations + approval set
+  policy.py          which writes auto-edit may approve; remote READ_ONLY set
+  textfiles.py       encoding/BOM/line-ending detection, atomic writes (both modes)
   shell.py           runs one command (both modes): empty stdin, tree kill
   remote_exec.py     tool implementations used in REMOTE mode (separate copy!)
   remote.py          websocket client for remote mode
-  prompts.py         the system prompt (43 lines)
+  wsjson.py          the RFC 6455 client remote.py talks through (proxy CONNECT)
+  prompts.py         the system prompt, rebuilt per request
   auth.py            OTP login client + credential store
   net.py             the User-Agent every outbound request carries (see below)
   websearch.py       web_search / fetch_url: SSRF guard + untrusted envelope
   config.py          settings.json + JOJO_HOST / JOJO_MODEL precedence
+  store.py           chat history (JSONL) + optional recall index (SQLite)
+  headless.py        plain REPL / one-shot runner without curses
+tui/tests/           pytest suite — see tui/tests/README.md
 server/
   backend/           runs the agent loop for remote mode; serves ai.jojocode.in
-  control-plane/     accounts, grants, audit, OTP  ← deployed, :7460 (memory store)
-  shared/            protocol, rbac, authorize
+  control-plane/     accounts, grants, audit, OTP  ← deployed, :7460 (Postgres)
+  shared/            protocol, rbac, authorize, Prisma schema
+  scripts/           backup-db.sh
+deploy/              systemd user units (nightly DB backup)
 install/             install.sh (Linux/macOS), install.ps1 (Windows)
-web/index.html       the ai.jojocode.in landing page (single self-contained file)
+web/index.html       the ai.jojocode.in landing page (one file; three.js from cdnjs)
 web/bg-test.mjs      browser regression for the backdrop (needs playwright)
 docs/                ARCHITECTURE.md, BUILD-PLAN.md, WEB-SEARCH-PLAN.md
 current_tasks.md     what is in flight right now — read this first
 ```
 
+Every folder has a README.md listing its files and their functions. Keep them
+current when you add, move or rename something.
+
 ## The two modes (and the trap)
 
 | | Local | Remote |
 |---|---|---|
-| Drives the model | TUI → Ollama | `server/backend` → Ollama |
+| Drives the model | TUI → Ollama or an OpenAI-compatible server | `server/backend` → Ollama |
 | **Runs the tools** | this machine | **still this machine** |
 | Schema read from | `tools.py` | `server/backend/src/tools.ts` |
 | Implementation | `tools.py` `IMPLS` | `remote_exec.py` |
@@ -55,20 +70,30 @@ path-jailed to the project root. Tools never run on the server.
 > ### ⚠️ Adding a tool means touching three files
 > `tools.py` (schema + impl), `tools.ts` (schema), `remote_exec.py` (impl).
 > `remote_exec.py` does **not** import from `tools.py` — it has its own `_jail`,
-> `_clip` and `_dispatch`. (Running a command is the exception: both go
-> through `shell.py`, so stdin and timeout handling cannot drift.)
+> `_clip` and `_dispatch`. (Running a command and reading/writing text files
+> are the exceptions: both modes go through `shell.py` and `textfiles.py`, so
+> stdin, timeout, encoding and line-ending handling cannot drift.)
 >
-> **This has already drifted.** Local advertises `list_dir, read_file,
-> write_file, edit_file, run_bash, search, change_dir, finish`. Remote
-> advertises `list_dir, read_file, write_file, run_command`. Four tools exist
-> only locally, and `run_bash`/`run_command` are one idea with two names.
-> Check both lists before believing a tool exists.
+> **The lists differ.** Local advertises `list_dir, read_file, write_file,
+> edit_file, run_bash, search, change_dir, web_search, fetch_url, finish`.
+> Remote advertises `list_dir, read_file, write_file, run_command, web_search,
+> fetch_url`. `run_bash`/`run_command` are one idea with two names. Check both
+> lists before believing a tool exists.
+>
+> **Remote approvals are decided by the client.** `remote.py` asks for every
+> tool the server marks destructive *and* every tool not in
+> `policy.READ_ONLY` — so a tool the server adds later is gated by default.
 
 ## Conventions
 
 - **Approval gate.** `APPROVAL_REQUIRED = {"write_file", "edit_file",
-  "run_bash"}` in `tools.py`. This is the main safety property of the product —
-  do not weaken it to make a feature smoother.
+  "run_bash", "web_search", "fetch_url"}` in `tools.py` — everything that
+  changes state, runs code, or sends anything off the machine (a URL's query
+  string is an outbound channel). This is the main safety property of the
+  product — do not weaken it to make a feature smoother. Auto-edit (`--trust`, `a`) is
+  bounded by `policy.auto_write_ok`: inside the project root the *user* chose
+  (not the model's `change_dir`), never dot-files, never when the root is `~`
+  or `/`. The approval panel shows the full request through `cols.visible`.
 - **Tool output is bounded.** Use the existing `_clip()`; never return a whole
   file or page into the model's context.
 - **Tool errors are strings, not exceptions.** `run_tool()` catches and returns
@@ -77,10 +102,20 @@ path-jailed to the project root. Tools never run on the server.
   behaviourally is a tool the model won't reach for.
 - **Not every model is gpt-oss.** The installer recommends qwen2.5-coder for
   most machines. Never send a request field only some models accept — ask
-  `OllamaClient.capabilities()` (`think` levels are gpt-oss only; `tools` is a
-  400 on codellama/gemma, which run in text mode). Model content always passes
+  `capabilities()` (`think` levels are gpt-oss only; `tools` is a 400 on
+  codellama/gemma, which run in text mode). Model content always passes
   through `toolcalls.StreamFilter` before the UI sees it: qwen2.5-coder writes
   its tool calls as JSON *text*, and printing that was the bug.
+- **Not every server is Ollama.** `backends.make_client` returns an
+  `OpenAIClient` for hosts ending in `/v1`; both clients yield the same event
+  dicts (`content`, `thinking`, `tool_calls`, `done`, `error`). Add a feature
+  to both, or to neither.
+- **Model HTTP goes through `transport.py`**, not bare urllib: it is what
+  makes Ctrl-C work while a server is silent, and what keeps a proxy from
+  swallowing `localhost`.
+- **Text on screen goes through `cols.py`.** Widths are display columns, not
+  `len()`; model and tool text is passed through `clean()` so escape sequences
+  cannot reach the terminal.
 - **Files are UTF-8, always.** Every text `open()` names `encoding=` — the
   locale default is cp1252 on Windows. `test_tools_platform.py` enforces it.
 - Stdlib-only in the TUI where possible: the installer's promise is a venv and
@@ -98,9 +133,13 @@ into `npm test` yet:
 
 ```sh
 python3 -m venv .venv && .venv/bin/pip install pytest
-.venv/bin/python -m pytest tui/tests -q       # 104 tests (fake Ollama, a pty)
+.venv/bin/python -m pytest tui/tests -q       # fake Ollama / OpenAI servers, a pty
 node web/bg-test.mjs                          # the landing page, in a browser
 ```
+
+Nothing here has run on real Windows or against real model weights: the
+Windows paths are unit-tested with `os.name` patched, and models are faked by
+`tui/tests/fake_ollama.py`, which validates requests the way Ollama does.
 
 ## Deployment reality (verified 17 Sep 2026, afternoon)
 
