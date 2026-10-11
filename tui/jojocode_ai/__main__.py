@@ -21,11 +21,13 @@ def main(argv=None):
         description="JojoCode AI TUI - a curses agentic coding assistant (local Ollama, or a remote server)",
     )
     ap.add_argument("task", nargs="*", help="run this task once and exit (headless)")
-    ap.add_argument("--model", help="Ollama model tag (default gpt-oss:120b)")
+    ap.add_argument("--model", help="Ollama model tag (default: settings.json, else gpt-oss:120b)")
     ap.add_argument("--host", help="Ollama host URL")
     ap.add_argument("--cwd", help="working directory for tools")
     ap.add_argument("--ctx", type=int, help="context window (num_ctx)")
-    ap.add_argument("--think", help="off | low | medium | high")
+    ap.add_argument("--think", type=str.lower, choices=["off", "low", "medium", "high"],
+                    help="reasoning effort; levels apply to gpt-oss, other thinking "
+                         "models just think or don't")
     ap.add_argument("--max-steps", type=int, help="max tool iterations per turn")
     ap.add_argument("--yolo", action="store_true", help="auto-approve every tool")
     ap.add_argument("--trust", action="store_true",
@@ -153,7 +155,7 @@ def _run_tui_guarded(launch) -> int:
         path = _crash_log_path()
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "a") as f:
+            with open(path, "a", encoding="utf-8", errors="replace") as f:
                 f.write(traceback.format_exc() + "\n")
             where = path
         except OSError:

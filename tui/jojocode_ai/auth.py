@@ -26,7 +26,7 @@ def creds_path() -> str:
 
 def _load_all() -> dict:
     try:
-        with open(creds_path()) as f:
+        with open(creds_path(), encoding="utf-8") as f:
             return json.load(f)
     except (OSError, ValueError):
         return {}
@@ -43,7 +43,7 @@ def save_token(endpoint: str, token: str, email: str | None = None) -> None:
     data = _load_all()
     data[endpoint.rstrip("/")] = {"token": token, "email": email, "savedAt": int(time.time())}
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
     os.chmod(path, 0o600)
 
@@ -53,7 +53,7 @@ def forget(endpoint: str) -> bool:
     if data.pop(endpoint.rstrip("/"), None) is None:
         return False
     fd = os.open(creds_path(), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
     return True
 

@@ -18,7 +18,10 @@ over mail configuration.
 tui/jojocode_ai/     the Python TUI (the product)
   tui.py             curses UI (1111 lines — the big one)
   agent.py           local agent loop: model → tool_calls → tools → repeat
+  ollama_client.py   /api/chat client; reads model capabilities, shapes `think`
+  toolcalls.py       tool calls a model wrote as TEXT (JSON, fences, tags)
   tools.py           LOCAL tool schemas + implementations + approval set
+  shell.py           runs one command (both modes): empty stdin, tree kill
   remote_exec.py     tool implementations used in REMOTE mode (separate copy!)
   remote.py          websocket client for remote mode
   prompts.py         the system prompt (43 lines)
@@ -52,7 +55,8 @@ path-jailed to the project root. Tools never run on the server.
 > ### ⚠️ Adding a tool means touching three files
 > `tools.py` (schema + impl), `tools.ts` (schema), `remote_exec.py` (impl).
 > `remote_exec.py` does **not** import from `tools.py` — it has its own `_jail`,
-> `_clip` and `_dispatch`.
+> `_clip` and `_dispatch`. (Running a command is the exception: both go
+> through `shell.py`, so stdin and timeout handling cannot drift.)
 >
 > **This has already drifted.** Local advertises `list_dir, read_file,
 > write_file, edit_file, run_bash, search, change_dir, finish`. Remote
@@ -71,6 +75,14 @@ path-jailed to the project root. Tools never run on the server.
   `error: …` so the model can read and recover. Keep that.
 - **The prompt is part of the feature.** A tool `prompts.py` doesn't describe
   behaviourally is a tool the model won't reach for.
+- **Not every model is gpt-oss.** The installer recommends qwen2.5-coder for
+  most machines. Never send a request field only some models accept — ask
+  `OllamaClient.capabilities()` (`think` levels are gpt-oss only; `tools` is a
+  400 on codellama/gemma, which run in text mode). Model content always passes
+  through `toolcalls.StreamFilter` before the UI sees it: qwen2.5-coder writes
+  its tool calls as JSON *text*, and printing that was the bug.
+- **Files are UTF-8, always.** Every text `open()` names `encoding=` — the
+  locale default is cp1252 on Windows. `test_tools_platform.py` enforces it.
 - Stdlib-only in the TUI where possible: the installer's promise is a venv and
   no build tools.
 
@@ -86,7 +98,7 @@ into `npm test` yet:
 
 ```sh
 python3 -m venv .venv && .venv/bin/pip install pytest
-.venv/bin/python -m pytest tui/tests -q       # 40 tests
+.venv/bin/python -m pytest tui/tests -q       # 104 tests (fake Ollama, a pty)
 node web/bg-test.mjs                          # the landing page, in a browser
 ```
 

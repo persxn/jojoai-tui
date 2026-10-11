@@ -8,6 +8,56 @@ the `jojocode.in` domain and its Brevo mailer).
 
 ---
 
+## 11 Oct — models other than gpt-oss; TUI bugs on Windows and Linux
+
+### Raw JSON instead of an answer on non-gpt-oss models — **fixed; verified against a fake Ollama, not a real model**
+Three stacked faults, all reproduced first:
+1. `think: "medium"` (the default) is a 400 "does not support thinking" on every
+   model without thinking — including every qwen2.5-coder the installer picks.
+   The client now reads `capabilities` from `/api/show`: levels for gpt-oss
+   only, `true/false` for other thinkers, nothing for the rest; old Ollama is
+   handled by learning from the 400.
+2. qwen2.5-coder writes its tool call as JSON *text*; the agent printed it as
+   the answer. `toolcalls.StreamFilter` now lifts calls out of the stream (bare
+   JSON, fences, `<tool_call>`, `<function=…>`, `[TOOL_CALLS]`) and releases
+   look-alikes (a JSON answer the user asked for) untouched.
+3. `tools` is a 400 on codellama/gemma/phi. Those now run in text mode: tools
+   described in the prompt, results sent back as user turns.
+Also: a `finish` summary no longer vanishes after streamed prose, and is no
+longer replaced by the output of whichever tool ran last; Ollama errors read as
+sentences, not `{"error": …}`; `has_model` needs the exact tag.
+
+Verified with `tui/tests/fake_ollama.py`, which validates `think`/`tools` the way
+Ollama's `server/routes.go` does, and through the real curses TUI in a pty.
+**Not** run against real model weights — this environment cannot reach the
+Ollama registry. First thing to do on a real box: `jojo --model
+qwen2.5-coder:7b` and one task that needs a tool.
+
+### TUI bugs, Windows and Linux — **fixed, tested on Linux; Windows not run**
+- Ctrl-C mid-turn quit the app (cbreak mode → SIGINT). Raw mode now; pty test.
+- File tools and chat history used the locale codec — cp1252 on Windows: UTF-8
+  source garbled, emoji/Hindi/CJK raised and failed the turn. UTF-8 everywhere,
+  enforced by a static test.
+- `edit_file` on Windows rewrote LF files as CRLF. Files keep their endings.
+- `run_bash`: stdin was the terminal (prompts hung the agent), the timeout could
+  not kill a server the command started (agent hung forever), and one
+  undecodable byte lost the output. `shell.py`, shared with remote mode.
+- `replace_all: "false"` replaced everything; `search` via ripgrep read the
+  chat-history directory; the prompt told Windows to use `python3` and claimed
+  there was no internet while offering web search.
+
+### Found, deliberately not changed
+- Remote mode ignores `[a]lways` at the approval prompt (`remote.py` only checks
+  `*`), so it asks every time. Fixing it loosens the approval gate: owner's call.
+- `run_bash` cannot be interrupted mid-command; Ctrl-C lands after it returns.
+- The transcript is re-wrapped in full every frame (~30/s): CPU grows with the
+  length of the chat.
+- Wide characters are counted as one column (layout clipping, not data loss).
+- `/cwd` and `change_dir` do not update the "Working directory" line in the
+  system prompt.
+
+---
+
 ## 21 Sep — finishing the plate
 
 ### Web search in JojoCode — **done, deployed, verified live**

@@ -101,9 +101,12 @@ class Store:
         """Record a message to the session log (called for user + assistant)."""
         rec = {"ts": time.time(), "role": role, "content": content}
         try:
-            with open(self.session_path, "a") as f:
+            # UTF-8, not the locale: on Windows that is cp1252, and the first
+            # "→", emoji or Hindi word in a message raised UnicodeEncodeError
+            # here — before the model was even asked — failing the whole turn.
+            with open(self.session_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        except OSError:
+        except (OSError, ValueError):
             pass
         if role in ("user", "assistant"):
             self._index(role, content)
@@ -119,7 +122,7 @@ class Store:
                 v = json.loads(r.read()).get("embedding")
             self._embed_ok = bool(v)
             return v
-        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError):
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, ValueError):
             self._embed_ok = False
             return None
 
@@ -193,7 +196,7 @@ class Store:
                 continue
             first_user, n = "", 0
             try:
-                with open(os.path.join(sd, fn)) as f:
+                with open(os.path.join(sd, fn), encoding="utf-8", errors="replace") as f:
                     for line in f:
                         try:
                             r = json.loads(line)
@@ -229,7 +232,7 @@ class Store:
         path = os.path.join(self.dir, "sessions", session_id + ".jsonl")
         msgs = []
         try:
-            with open(path) as f:
+            with open(path, encoding="utf-8", errors="replace") as f:
                 for line in f:
                     try:
                         r = json.loads(line)

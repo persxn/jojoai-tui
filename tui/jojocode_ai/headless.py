@@ -5,6 +5,7 @@ Useful for scripting, piping, and testing the agent without a full terminal UI.
 
 from __future__ import annotations
 
+import os
 import sys
 
 from .agent import Agent
@@ -16,8 +17,39 @@ C = {
 }
 
 
+def _enable_ansi() -> bool:
+    """Whether colour escapes will render rather than print as `←[2m`.
+
+    A Windows console only interprets them once the program asks for it
+    (ENABLE_VIRTUAL_TERMINAL_PROCESSING); Windows Terminal does by default,
+    conhost — what cmd.exe and PowerShell open in on many machines — does not.
+    """
+    if os.environ.get("NO_COLOR") or not sys.stdout.isatty():
+        return False
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        k32 = ctypes.windll.kernel32
+        h = k32.GetStdHandle(-11)                      # STD_OUTPUT_HANDLE
+        mode = wintypes.DWORD()
+        if not k32.GetConsoleMode(h, ctypes.byref(mode)):
+            return False
+        return bool(k32.SetConsoleMode(h, mode.value | 0x0004))
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+_COLOR = None
+
+
 def _c(key, text):
-    if not sys.stdout.isatty():
+    global _COLOR
+    if _COLOR is None:
+        _COLOR = _enable_ansi()
+    if not _COLOR:
         return text
     return f"{C[key]}{text}{C['reset']}"
 
@@ -67,10 +99,13 @@ def _render(agent: Agent, text: str):
             print(_c("dim", out if len(out) < 1500 else out[:1500] + "\n…"))
         elif kind == "recall":
             print(_c("dim", f"· recalled {ev[1]} snippet(s) from earlier chats"))
+        elif kind == "info":
+            print(_c("dim", f"· {ev[1]}"))
         elif kind == "tool_denied":
             print(_c("red", f"✗ denied: {ev[1]}"))
         elif kind == "final":
-            if ev[1] and not streamed:
+            shown = ev[2] if len(ev) > 2 else streamed
+            if ev[1] and not shown:
                 print(_c("green", "\n" + ev[1]))
         elif kind == "error":
             print(_c("red", f"\n[error] {ev[1]}"))
@@ -87,6 +122,13 @@ def _short(args):
 
 
 def run(cfg: Config, one_shot: str | None = None):
+    # Piped or redirected on Windows, stdout is cp1252 and the first "→" this
+    # prints raised UnicodeEncodeError — in the mode meant for scripting.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
     agent = Agent(cfg, approver=_approver(cfg))
     try:
         from .store import Store

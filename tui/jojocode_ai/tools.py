@@ -7,10 +7,13 @@ and returns a string.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
 from dataclasses import dataclass
+
+from . import shell
 
 
 MAX_OUTPUT = 20000  # chars returned to the model per tool call
@@ -47,11 +50,58 @@ def _resolve(ctx: Ctx, path: str) -> str:
 def _blocked(path: str) -> bool:
     """JojoAI's own history/index is off-limits to the tools."""
     try:
-        rp = os.path.realpath(path)
-        dd = _jojo_data_dir()
+        # normcase: Windows paths are case-insensitive, and a guard that only
+        # matched one spelling would not be one.
+        rp = os.path.normcase(os.path.realpath(path))
+        dd = os.path.normcase(_jojo_data_dir())
         return rp == dd or rp.startswith(dd + os.sep)
     except OSError:
         return False
+
+
+def _int(value, default: int) -> int:
+    """Models send numbers as 50, "50", null or "" — all of them mean something."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _bool(value) -> bool:
+    # bool("false") is True: replace_all="false" from a small model used to
+    # replace every occurrence when it meant exactly the opposite.
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "on")
+    return bool(value)
+
+
+# --------------------------------------------------------------------------- #
+# file text
+#
+# Always UTF-8. The locale default is cp1252 on Windows, which garbled every
+# non-ASCII character a UTF-8 source file holds on the way in and failed with
+# UnicodeEncodeError on the way out (an emoji, a "→", any Hindi or CJK text).
+#
+# Line endings are the file's own. Text mode on Windows wrote "\r\n" for every
+# "\n", so one edit_file to an LF file turned the whole file into a diff.
+# surrogateescape lets bytes that are not UTF-8 pass through an edit untouched.
+# --------------------------------------------------------------------------- #
+
+def _read_text(path: str) -> tuple[str, str]:
+    """(text with "\n" line endings, the file's own line ending)."""
+    with open(path, "r", encoding="utf-8", errors="surrogateescape", newline="") as f:
+        raw = f.read()
+    crlf = raw.count("\r\n")
+    nl = "\r\n" if crlf and crlf >= raw.count("\n") - crlf else "\n"
+    return raw.replace("\r\n", "\n"), nl
+
+
+def _write_text(path: str, text: str, nl: str = "\n") -> None:
+    text = text.replace("\r\n", "\n")
+    if nl != "\n":
+        text = text.replace("\n", nl)
+    with open(path, "w", encoding="utf-8", errors="surrogateescape", newline="") as f:
+        f.write(text)
 
 
 def _clip(text: str) -> str:
@@ -92,10 +142,10 @@ def t_read_file(args, ctx: Ctx) -> str:
         return "error: JojoAI's history directory is not accessible to tools"
     if not os.path.isfile(path):
         return f"error: no such file: {path}"
-    offset = int(args.get("offset", 1))
-    limit = int(args.get("limit", 400))
+    offset = _int(args.get("offset"), 1)
+    limit = _int(args.get("limit"), 400)
     try:
-        with open(path, "r", errors="replace") as f:
+        with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
             lines = f.readlines()
     except OSError as e:
         return f"error: {e}"
@@ -113,11 +163,13 @@ def t_write_file(args, ctx: Ctx) -> str:
     if _blocked(path):
         return "error: JojoAI's history directory is not writable by tools"
     content = args.get("content", "")
+    if not isinstance(content, str):
+        content = json.dumps(content, indent=2) if isinstance(content, (dict, list)) else str(content)
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     existed = os.path.isfile(path)
     try:
-        with open(path, "w") as f:
-            f.write(content)
+        nl = _read_text(path)[1] if existed else "\n"
+        _write_text(path, content, nl)
     except OSError as e:
         return f"error: {e}"
     verb = "overwrote" if existed else "created"
@@ -128,14 +180,15 @@ def t_edit_file(args, ctx: Ctx) -> str:
     path = _resolve(ctx, args["path"])
     if _blocked(path):
         return "error: JojoAI's history directory is not writable by tools"
-    old = args["old_string"]
-    new = args["new_string"]
-    replace_all = bool(args.get("replace_all", False))
+    old = args["old_string"].replace("\r\n", "\n")
+    new = args["new_string"].replace("\r\n", "\n")
+    replace_all = _bool(args.get("replace_all", False))
     if not os.path.isfile(path):
         return f"error: no such file: {path}"
+    if not old:
+        return "error: old_string is empty; use write_file to create or replace a whole file"
     try:
-        with open(path, "r", errors="replace") as f:
-            data = f.read()
+        data, nl = _read_text(path)
     except OSError as e:
         return f"error: {e}"
     count = data.count(old)
@@ -146,8 +199,7 @@ def t_edit_file(args, ctx: Ctx) -> str:
                 f"or pass replace_all=true")
     data = data.replace(old, new) if replace_all else data.replace(old, new, 1)
     try:
-        with open(path, "w") as f:
-            f.write(data)
+        _write_text(path, data, nl)
     except OSError as e:
         return f"error: {e}"
     return f"edited {path} ({count if replace_all else 1} replacement(s))"
@@ -155,39 +207,59 @@ def t_edit_file(args, ctx: Ctx) -> str:
 
 def t_run_bash(args, ctx: Ctx) -> str:
     cmd = args["command"]
-    timeout = int(args.get("timeout", 120))
+    # Small models mix up seconds and milliseconds; 120000 "seconds" would let
+    # a hung command hold the agent for a day and a half.
+    timeout = min(max(_int(args.get("timeout"), 120), 1), 3600)
     try:
-        p = subprocess.run(
-            cmd, shell=True, cwd=ctx.cwd, capture_output=True, text=True,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired:
-        return f"error: command timed out after {timeout}s"
+        out, err, code, timed_out = shell.run(cmd, ctx.cwd, timeout)
     except OSError as e:
         return f"error: {e}"
-    out = (p.stdout or "")
-    err = (p.stderr or "")
     parts = []
+    if timed_out:
+        note = " (output so far is below)" if (out or err) else ""
+        parts.append(f"error: command timed out after {timeout}s and was stopped{note}")
     if out:
         parts.append(out.rstrip())
     if err:
         parts.append("[stderr]\n" + err.rstrip())
-    parts.append(f"[exit {p.returncode}]")
+    if not timed_out:
+        parts.append(f"[exit {code}]")
     return _clip("\n".join(parts))
+
+
+def _hit_path(line: str) -> str:
+    """The file part of an rg `path:line:text` hit. Windows paths carry a drive colon."""
+    start = 2 if len(line) > 2 and line[1] == ":" and line[0].isalpha() else 0
+    i = line.find(":", start)
+    return line[:i] if i >= 0 else line
 
 
 def t_search(args, ctx: Ctx) -> str:
     pattern = args["pattern"]
     path = _resolve(ctx, args.get("path", "."))
+    if _blocked(path):
+        return "error: JojoAI's history directory is not accessible to tools"
     rg = shutil.which("rg")
     if rg:
         try:
             p = subprocess.run(
                 [rg, "--line-number", "--no-heading", "--color", "never",
                  "-e", pattern, path],
-                capture_output=True, text=True, timeout=60,
+                stdin=subprocess.DEVNULL, capture_output=True, timeout=60,
+                encoding="utf-8", errors="replace",
             )
-            out = p.stdout.strip()
+            # The walk below skips JojoAI's history; rg has to be filtered
+            # after the fact, or a search of ~ reads every past chat.
+            hits, size = [], 0
+            for ln in p.stdout.splitlines():
+                if ln.strip() and not _blocked(_hit_path(ln)):
+                    hits.append(ln)
+                    size += len(ln) + 1
+                    if size > 2 * MAX_OUTPUT:
+                        break
+            out = "\n".join(hits)
+            if not out and p.returncode == 2 and p.stderr.strip():
+                return f"error: {p.stderr.strip()[:500]}"      # a bad regex, say so
             return _clip(out) if out else "(no matches)"
         except (subprocess.TimeoutExpired, OSError):
             pass
@@ -213,7 +285,7 @@ def t_search(args, ctx: Ctx) -> str:
                 with open(fp, "rb") as fb:
                     if b"\x00" in fb.read(2048):          # looks binary
                         continue
-                with open(fp, "r", errors="ignore") as f:
+                with open(fp, "r", encoding="utf-8", errors="ignore") as f:
                     for i, line in enumerate(f, 1):
                         if rx.search(line):
                             hits.append(f"{fp}:{i}:{line.rstrip()[:400]}")
@@ -302,7 +374,9 @@ IMPLS = {
 def run_tool(name: str, args: dict, ctx: Ctx) -> str:
     fn = IMPLS.get(name)
     if fn is None:
-        return f"error: unknown tool {name!r}"
+        # Name the real ones: a model that guessed "list_files" can only
+        # correct itself if it is told what exists.
+        return f"error: unknown tool {name!r}. Available tools: {', '.join(IMPLS)}"
     try:
         return fn(args or {}, ctx)
     except KeyError as e:

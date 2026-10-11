@@ -27,6 +27,28 @@ third-party dependency is `windows-curses`, and only on Windows.
 - **Crash**: `curses.wrapper` restores the terminal, then the traceback is written to
   `~/.local/share/jojocode-ai/crash.log` (never dumped over the restored screen).
 
+## Models
+
+Local mode works with any chat model Ollama serves, not only gpt-oss. Before the
+first request the client reads the model's `capabilities` from `/api/show` and
+shapes the request to fit:
+
+| The model has | What is sent | Examples |
+|---|---|---|
+| tools + thinking, gpt-oss | tools, `think: "low"/"medium"/"high"` | gpt-oss:20b, gpt-oss:120b |
+| tools + thinking | tools, `think: true/false` | qwen3, deepseek-r1 (recent) |
+| tools, no thinking | tools, no `think` | qwen2.5-coder, llama3.1/3.2, mistral |
+| no tools | tools described in the system prompt instead | codellama, gemma, phi |
+
+Many models write tool calls into their reply as text rather than through
+Ollama's `tool_calls` field — qwen2.5-coder as bare JSON, others fenced, in
+`<tool_call>` tags, as `<function=…>` or after `[TOOL_CALLS]`.
+`jojocode_ai/toolcalls.py` lifts those out before they reach the screen, so the
+tool runs instead of its JSON being printed. Ollama too old to report
+capabilities still works: the client learns from its 400 and retries.
+
+A model that cannot think simply does not: `Tab` / `/think` change nothing for it.
+
 ## Scrolling the conversation
 
 | Gesture | Action |
@@ -47,7 +69,26 @@ terminal's own scrollback instead. While capture is on, hold **Shift** (or
   status line shows `↑N scrolled — End for latest`. Sending a message, or `End`,
   returns to the bottom.
 
+## Keys
+
+`Ctrl-C` interrupts a running turn (and denies a pending approval); at an idle,
+empty prompt it quits. The TUI runs the terminal in raw mode so Ctrl-C arrives
+as a key — in cbreak mode it was a signal and quit the app mid-turn. Raw mode
+also means `Ctrl-Z` does not suspend and `Ctrl-S`/`Ctrl-Q` are not flow control.
+
+## Commands the agent runs
+
+`run_bash` runs through the platform shell — `/bin/sh` on Linux and macOS,
+**cmd.exe on Windows** (the system prompt tells the model which). Commands get
+an empty stdin, so anything that waits for keyboard input fails fast instead of
+hanging; a timeout stops the whole process tree, servers it started included.
+Files are always read and written as UTF-8 and keep their own line endings.
+
 ## Known rough edges
+
+- **Wide characters** (CJK, most emoji) are measured as one column each, so a
+  line full of them can be clipped at the right edge or misalign the right-hand
+  "you" bubble.
 
 - **Paste detection** keeps newlines (instead of submitting) only while a run of
   ≥2 keystrokes is arriving back-to-back (`< 12 ms` apart). A normal Enter after

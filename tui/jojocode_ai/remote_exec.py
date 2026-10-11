@@ -10,9 +10,11 @@ Returns a dict ready to drop into a `tool_result` frame (minus `t`/`id`).
 
 from __future__ import annotations
 
+import json
 import os
-import subprocess
 import time
+
+from . import shell
 
 MAX_READ = 100_000
 MAX_OUT = 20_000
@@ -22,7 +24,9 @@ def _jail(root: str, path: str) -> str | None:
     """Resolve `path` under `root`; None if it escapes."""
     root = os.path.realpath(root)
     full = os.path.realpath(os.path.join(root, path or "."))
-    if full == root or full.startswith(root + os.sep):
+    # normcase: on Windows C:\Proj and c:\proj are the same root
+    r, f = os.path.normcase(root), os.path.normcase(full)
+    if f == r or f.startswith(r + os.sep):
         return full
     return None
 
@@ -31,6 +35,17 @@ def _clip(s: str, limit: int = MAX_OUT) -> str:
     if len(s) <= limit:
         return s
     return s[: limit - 400] + f"\n... [truncated {len(s) - limit + 400} chars] ...\n" + s[-300:]
+
+
+def _crlf(path: str) -> bool:
+    """Does an existing file use Windows line endings? (Keep them if so.)"""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(65536)
+    except OSError:
+        return False
+    crlf = head.count(b"\r\n")
+    return bool(crlf) and crlf >= head.count(b"\n") - crlf
 
 
 def execute(name: str, args: dict, root: str) -> dict:
@@ -43,6 +58,11 @@ def execute(name: str, args: dict, root: str) -> dict:
         payload = {"ok": False, "error": f"permission denied: {e}"}
     except OSError as e:
         payload = {"ok": False, "error": str(e)}
+    except Exception as e:  # noqa: BLE001
+        # Anything else (a bad argument type, an encoding error) used to escape
+        # here, so no tool_result was ever sent and the server's turn hung
+        # waiting for one. The model gets told instead, like every other error.
+        payload = {"ok": False, "error": f"{type(e).__name__}: {e}"}
     payload.setdefault("ok", True)
     payload["durationMs"] = int((time.time() - t0) * 1000)
     return payload
@@ -99,7 +119,7 @@ def _dispatch(name: str, args: dict, root: str) -> dict:
         if not os.path.isfile(full):
             return {"ok": False, "error": f"no such file: {args.get('path')}"}
         cap = int(args.get("max_bytes", MAX_READ) or MAX_READ)
-        with open(full, "r", errors="replace") as f:
+        with open(full, "r", encoding="utf-8", errors="replace") as f:
             data = f.read(cap + 1)
         more = len(data) > cap
         return {"ok": True, "content": data[:cap] + ("\n... [clipped]" if more else "")}
@@ -109,8 +129,15 @@ def _dispatch(name: str, args: dict, root: str) -> dict:
         if full is None:
             return {"ok": False, "refused": "policy", "error": "path escapes project root"}
         content = args.get("content", "")
+        if not isinstance(content, str):
+            content = json.dumps(content, indent=2) if isinstance(content, (dict, list)) else str(content)
+        content = content.replace("\r\n", "\n")
         os.makedirs(os.path.dirname(full) or ".", exist_ok=True)
-        with open(full, "w") as f:
+        # UTF-8 and the file's own line endings, as in tools.py: the locale
+        # codec is cp1252 on Windows and text mode would CRLF every line.
+        if _crlf(full):
+            content = content.replace("\n", "\r\n")
+        with open(full, "w", encoding="utf-8", newline="") as f:
             f.write(content)
         return {"ok": True, "bytesWritten": len(content.encode())}
 
@@ -119,16 +146,15 @@ def _dispatch(name: str, args: dict, root: str) -> dict:
         if not cmd:
             return {"ok": False, "error": "no command"}
         timeout = int(args.get("timeout_ms", 120_000) or 120_000) / 1000
-        try:
-            p = subprocess.run(cmd, shell=True, cwd=root, capture_output=True,
-                               text=True, timeout=timeout)
-        except subprocess.TimeoutExpired:
-            return {"ok": False, "refused": "timeout", "error": f"timed out after {timeout:.0f}s"}
+        out, err, code, timed_out = shell.run(cmd, root, timeout)
+        if timed_out:
+            return {"ok": False, "refused": "timeout", "error": f"timed out after {timeout:.0f}s",
+                    "stdout": _clip(out), "stderr": _clip(err)}
         return {
-            "ok": p.returncode == 0,
-            "stdout": _clip(p.stdout or ""),
-            "stderr": _clip(p.stderr or ""),
-            "exitCode": p.returncode,
+            "ok": code == 0,
+            "stdout": _clip(out),
+            "stderr": _clip(err),
+            "exitCode": code,
         }
 
     return {"ok": False, "error": f"unknown tool {name!r}"}

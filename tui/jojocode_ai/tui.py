@@ -13,6 +13,7 @@ import math
 import os
 import queue
 import random
+import re
 import textwrap
 import threading
 import time
@@ -304,27 +305,31 @@ class TUI:
             k = ev[0]
             if k == "thinking":
                 if self.show_thinking:
-                    self._extend_last("thinking", ev[1])
+                    self._extend_last("thinking", _clean_delta(ev[1]))
             elif k == "assistant":
                 self._streamed_turn = True
-                self._extend_last("assistant", ev[1])
+                self._extend_last("assistant", _clean_delta(ev[1]))
             elif k == "recall":
                 self._append("info", f"recalled {ev[1]} snippet(s) from earlier chats")
                 self._toast_msg(f"recalled {ev[1]} snippet(s)")
             elif k == "info":
-                self._append("info", ev[1])
+                self._append("info", _clean(ev[1]))
             elif k == "tool_start":
-                self._append("tool", f"{ev[1]}  {_fmt_args(ev[2])}")
+                self._append("tool", _clean(f"{ev[1]}  {_fmt_args(ev[2])}"))
             elif k == "tool_end":
-                out = ev[2]
+                out = _clean(ev[2])
                 self._append("tool_out", out if len(out) < 4000 else out[:4000] + "\n…[clipped]")
             elif k == "tool_denied":
                 self._append("error", f"denied: {ev[1]}")
             elif k == "final":
-                if ev[1] and not self._streamed_turn:
-                    self._append("assistant", ev[1])
+                # The agent says whether this text was streamed. Guessing from
+                # "anything streamed this turn" lost every `finish` summary that
+                # followed a step with prose in it.
+                shown = ev[2] if len(ev) > 2 else self._streamed_turn
+                if ev[1] and not shown:
+                    self._append("assistant", _clean(ev[1]))
             elif k == "error":
-                self._append("error", ev[1])
+                self._append("error", _clean(ev[1]))
             elif k == "stats":
                 s = ev[1]
                 ec, ed = s.get("eval_count"), s.get("eval_duration")
@@ -902,11 +907,13 @@ class TUI:
             ts = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
             path = os.path.expanduser(f"~/jojoai-transcript-{ts}.txt")
         try:
-            with open(os.path.expanduser(path), "w") as f:
+            # UTF-8: with the Windows locale codec the first emoji in the chat
+            # raised UnicodeEncodeError, which nothing caught — the TUI died.
+            with open(os.path.expanduser(path), "w", encoding="utf-8") as f:
                 for b in self.blocks:
                     f.write(f"[{b.kind}] {b.text}\n\n")
             self._toast_msg(f"saved → {path}")
-        except OSError as e:
+        except (OSError, ValueError) as e:
             self._append("error", f"save failed: {e}")
 
     # -- input editing --------------------------------- #
@@ -947,6 +954,15 @@ class TUI:
         self._boot = time.time()
         stdscr.nodelay(True)
         stdscr.keypad(True)
+        try:
+            # curses.wrapper leaves the terminal in cbreak mode, where Ctrl-C is
+            # still SIGINT: it surfaced as KeyboardInterrupt in this loop and
+            # quit the whole app mid-turn instead of interrupting the agent.
+            # Raw mode delivers it as the key "\x03" (on Windows, PDCurses'
+            # raw() likewise turns off the console's own Ctrl-C handling).
+            curses.raw()
+        except curses.error:
+            pass
         self._enable_mouse(getattr(self.cfg, "mouse", True))
         self.theme.init()
 
@@ -990,8 +1006,15 @@ class TUI:
             try:
                 ch = stdscr.get_wch()
             except curses.error:
-                time.sleep(0.033)
-                continue
+                ch = None
+            except KeyboardInterrupt:      # a SIGINT raw mode did not stop
+                ch = "\x03"
+            if ch is None:
+                try:
+                    time.sleep(0.033)
+                    continue
+                except KeyboardInterrupt:
+                    ch = "\x03"
 
             if not self._splash_done:      # any key skips the splash
                 self._splash_done = True
@@ -1009,11 +1032,15 @@ class TUI:
                     self.approve_reply.put(True); self.pending_approval = None
                 elif ch in ("n", "N", "\x1b"):
                     self.approve_reply.put(False); self.pending_approval = None
+                elif ch == "\x03":                                # Ctrl-C: deny, and stop
+                    self.agent.interrupt()
+                    self.approve_reply.put(False); self.pending_approval = None
+                    self._toast_msg("interrupt requested")
                 continue
 
             if self.picker is not None:
                 pk = self.picker
-                if ch in ("\x1b", "q", "Q", "\x12"):        # Esc / q / Ctrl-R
+                if ch in ("\x1b", "q", "Q", "\x12", "\x03"):  # Esc / q / Ctrl-R / Ctrl-C
                     self.picker = None
                 elif ch in ("\n", "\r"):
                     self._view_session(pk["rows"][pk["sel"]][0])
@@ -1164,6 +1191,30 @@ class TUI:
 
 def _slen(s: str) -> int:
     return len(s)
+
+
+# Tool output is whatever the command printed: colour codes (`ls --color`,
+# npm, pytest), "\r" progress bars (pip, curl) and tabs. curses draws an
+# escape as "^[", jumps to column 0 on "\r" and expands a tab past the width
+# the layout counted — each one smeared the transcript.
+_ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[@-Z\\-_])")
+_CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def _clean(text: str) -> str:
+    """Make finished text safe to draw: no escapes, no carriage returns, no tabs."""
+    text = _ANSI.sub("", text).replace("\r\n", "\n")
+    if "\r" in text:
+        # a progress bar redraws its line: keep what it said last
+        text = "\n".join(ln.rsplit("\r", 1)[-1] if ln.rstrip("\r") else ""
+                         for ln in text.split("\n"))
+    return _CTRL.sub("", text.expandtabs(4))
+
+
+def _clean_delta(text: str) -> str:
+    """The streaming version: a "\r\n" can be split across two deltas, so
+    carriage returns are simply dropped rather than read as line breaks."""
+    return _CTRL.sub("", text.replace("\r", "").replace("\t", "    "))
 
 
 def _tname(think):

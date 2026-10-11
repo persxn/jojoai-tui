@@ -41,7 +41,7 @@ def load_settings() -> dict:
     """Never raises: a missing or corrupt settings file must not stop the TUI
     from starting, because its whole job is to make starting easier."""
     try:
-        with open(settings_path()) as f:
+        with open(settings_path(), encoding="utf-8") as f:
             data = json.load(f)
         return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
@@ -63,7 +63,7 @@ def save_settings(**values) -> str:
         else:
             data[k] = v
     tmp = path + ".tmp"
-    with open(tmp, "w") as f:
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
         f.write("\n")
     os.replace(tmp, path)          # atomic: never leaves a half-written file
