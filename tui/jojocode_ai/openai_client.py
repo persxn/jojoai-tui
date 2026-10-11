@@ -66,6 +66,13 @@ def to_openai(messages: list[dict]) -> list[dict]:
     return out
 
 
+def api_base(host: str) -> str:
+    """A bare server gets /v1; a URL that already names its API path (…/v1,
+    or Gemini's …/v1beta/openai) is used as given."""
+    host = host.rstrip("/")
+    return host + "/v1" if urllib.parse.urlsplit(host).path in ("", "/") else host
+
+
 def _first_int(d: dict, keys) -> int | None:
     for k in keys:
         v = d.get(k)
@@ -79,9 +86,7 @@ class OpenAIClient:
 
     def __init__(self, host: str, model: str, num_ctx: int = 32768, timeout: int = 600):
         host = host.rstrip("/")
-        # A bare server gets /v1; a URL that already names its API path
-        # (…/v1, or Gemini's …/v1beta/openai) is used as given.
-        self.base = host + "/v1" if urllib.parse.urlsplit(host).path in ("", "/") else host
+        self.base = api_base(host)
         self.host = host
         self.model = model
         self.num_ctx = num_ctx

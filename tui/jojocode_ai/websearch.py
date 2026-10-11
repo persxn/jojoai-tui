@@ -41,6 +41,7 @@ Stdlib only: the TUI's install promise is a venv and no build tools.
 
 from __future__ import annotations
 
+import codecs
 import html as htmllib
 import http.client
 import ipaddress
@@ -49,6 +50,7 @@ import re
 import secrets
 import socket
 import ssl
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -109,6 +111,9 @@ def _is_public(ip: str) -> bool:
     )
 
 
+_IDNA_DEVIATIONS = ("ß", "ς", "\u200c", "\u200d")
+
+
 def _normalize(url: str) -> str:
     """A URL urllib can send: IDNA host, percent-encoded path and query.
 
@@ -120,6 +125,11 @@ def _normalize(url: str) -> str:
         try:
             host.encode("ascii")
         except UnicodeEncodeError:
+            if any(c in host for c in _IDNA_DEVIATIONS):
+                # Python's codec is IDNA 2003, which maps faß.de to fass.de —
+                # a different, separately registered site.
+                raise WebError(f"{host} needs its punycode form (xn--…) to be fetched "
+                               "exactly; ask for the URL as the site writes it")
             host = host.encode("idna").decode("ascii")
         netloc = host if ":" not in host else f"[{host}]"
         if p.port:
@@ -133,8 +143,13 @@ def _normalize(url: str) -> str:
         raise WebError(f"that is not a usable URL: {e}") from e
 
 
-def _vet(url: str) -> tuple[str, int, str]:
-    """(host, port, the one checked address to connect to) — or WebError."""
+def _vet(url: str, proxied: bool = False) -> tuple[str, int, list[str]]:
+    """(host, port, the checked addresses to connect to) — or WebError.
+
+    `proxied`: the user's proxy will resolve the name. A name this machine
+    cannot resolve itself is then left to it (proxy-only networks have no
+    outside DNS, and every search failed there); a name that resolves here to
+    a private address is still refused, and so is a private IP literal."""
     try:
         parts = urllib.parse.urlsplit(url)
         port = parts.port or (443 if parts.scheme == "https" else 80)
@@ -150,6 +165,14 @@ def _vet(url: str) -> tuple[str, int, str]:
     try:
         infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
     except (socket.gaierror, UnicodeError) as e:
+        literal = True
+        try:
+            ipaddress.ip_address(host.strip("[]"))
+        except ValueError:
+            literal = False
+        if proxied and not literal and host.lower() != "localhost" \
+                and not host.lower().endswith((".localhost", ".local", ".internal")):
+            return host, port, []
         raise WebError(f"cannot resolve {host}: {e}") from e
 
     for info in infos:
@@ -162,10 +185,12 @@ def _vet(url: str) -> tuple[str, int, str]:
             )
     if not infos:
         raise WebError(f"cannot resolve {host}")
-    return host, port, infos[0][4][0]
+    # every vetted address, in order: a broken IPv6 route or one dead A
+    # record used to fail the fetch where the next address would have worked
+    return host, port, list(dict.fromkeys(info[4][0] for info in infos))
 
 
-def check_url(url: str) -> str:
+def check_url(url: str, proxied: bool = False) -> str:
     """
     Refuse a URL the agent must not fetch. Returns the URL when it is allowed.
 
@@ -173,7 +198,10 @@ def check_url(url: str) -> str:
     the thing worth checking — `internal.example.com` can resolve to 10.0.0.5,
     and a blocklist of names would never catch it.
     """
-    _vet(url)
+    if proxied:
+        _vet(url, proxied=True)
+    else:
+        _vet(url)
     return url
 
 
@@ -183,28 +211,60 @@ class _GuardedRedirects(urllib.request.HTTPRedirectHandler):
     max_redirections = MAX_REDIRECTS
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
-        check_url(newurl)
+        check_url(newurl, proxied=True)     # only used on the proxy path
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+def _dial(ips: list[str], port: int, timeout: float) -> socket.socket:
+    """The first of the vetted addresses that answers, as create_connection
+    would try a name's addresses — but never one that was not vetted."""
+    err: OSError | None = None
+    for ip in ips:
+        try:
+            return socket.create_connection((ip, port), timeout)
+        except OSError as e:
+            err = e
+    raise err or OSError("no address to connect to")
+
+
+class _Response(http.client.HTTPResponse):
+    """Skips interim 1xx answers (103 Early Hints) as http.client does only
+    for 100 Continue — taken as the response, the page came back empty."""
+
+    def begin(self):
+        while True:
+            super().begin()
+            if not (100 < self.status < 200 and self.status != 101):
+                return
+            self.headers = self.msg = None
+            # the interim response has no body: the next status line follows
+            self.length = None
+            self.chunked = False
+            self.will_close = False
+
+
 class _Pinned:
-    """Connections that dial the vetted address, keeping the name for TLS."""
+    """Connections that dial the vetted addresses, keeping the name for TLS."""
 
     class HTTP(http.client.HTTPConnection):
-        def __init__(self, host, port, ip, timeout):
+        response_class = _Response
+
+        def __init__(self, host, port, ips, timeout):
             super().__init__(host, port, timeout=timeout)
-            self._ip = ip
+            self._ips = [ips] if isinstance(ips, str) else list(ips)
 
         def connect(self):
-            self.sock = socket.create_connection((self._ip, self.port), self.timeout)
+            self.sock = _dial(self._ips, self.port, self.timeout)
 
     class HTTPS(http.client.HTTPSConnection):
-        def __init__(self, host, port, ip, timeout):
+        response_class = _Response
+
+        def __init__(self, host, port, ips, timeout):
             super().__init__(host, port, timeout=timeout, context=ssl.create_default_context())
-            self._ip = ip
+            self._ips = [ips] if isinstance(ips, str) else list(ips)
 
         def connect(self):
-            sock = socket.create_connection((self._ip, self.port), self.timeout)
+            sock = _dial(self._ips, self.port, self.timeout)
             # certificate and SNI are checked against the *name*, as a browser would
             self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
 
@@ -214,10 +274,15 @@ def _read_capped(resp, gzipped: bool, deadline: float) -> bytes:
     out = bytearray()
     d = zlib.decompressobj(16 + zlib.MAX_WBITS) if gzipped else None
     read = getattr(resp, "read1", None) or resp.read
-    while len(out) < MAX_BYTES and time.monotonic() < deadline:
+    cut = False
+    while len(out) < MAX_BYTES:
+        if time.monotonic() >= deadline:
+            cut = True
+            break
         try:
             chunk = read(65536)
-        except (OSError, EOFError):
+        except (OSError, EOFError, ValueError, AttributeError):
+            cut = time.monotonic() >= deadline      # the watchdog closed it
             break
         if not chunk:
             break
@@ -232,24 +297,50 @@ def _read_capped(resp, gzipped: bool, deadline: float) -> bytes:
                 d = None
                 continue
             break                               # truncated or corrupt: keep what decoded
-    return bytes(out[:MAX_BYTES])
+    return _Body(bytes(out[:MAX_BYTES]), cut)
+
+
+class _Body(bytes):
+    """A capped body that remembers whether the time limit cut it short."""
+
+    def __new__(cls, data: bytes, cut: bool = False):
+        b = super().__new__(cls, data)
+        b.cut = cut
+        return b
 
 
 _TEXTUAL = re.compile(r"^(text/|application/(json|xml|xhtml\+xml|javascript|ecmascript|"
                       r"ld\+json|x-sh|x-python|toml|yaml|x-yaml)|.*\+(json|xml)$)", re.I)
 
 
+_LATIN1_LABELS = {"iso-8859-1", "iso8859-1", "iso_8859-1", "latin1", "latin-1", "l1",
+                  "us-ascii", "ascii", "cp819", "ibm819", "windows-1252", "cp1252"}
+
+
 def _decode(raw: bytes, ctype: str) -> str:
     if ctype and not _TEXTUAL.match(ctype.split(";", 1)[0].strip()):
         raise WebError(f"that is not a text page ({ctype.split(';', 1)[0]}); "
                        "fetch_url can only read text and HTML")
-    if raw.startswith(b"%PDF") or b"\x00" in raw[:1024]:
-        raise WebError("that is a PDF or binary file; fetch_url can only read text and HTML")
     m = re.search(r"charset=[\"']?([\w.-]+)", ctype or "", re.I) or \
         re.search(rb"<meta[^>]+charset=[\"']?([\w.-]+)", raw[:4096], re.I)
     charset = m.group(1) if m else "utf-8"
     if isinstance(charset, bytes):
         charset = charset.decode("ascii", "replace")
+    charset = charset.lower()
+    for bom, enc in ((codecs.BOM_UTF32_LE, "utf-32"), (codecs.BOM_UTF32_BE, "utf-32"),
+                     (codecs.BOM_UTF16_LE, "utf-16"), (codecs.BOM_UTF16_BE, "utf-16")):
+        if raw.startswith(bom):
+            charset = enc
+            break
+    wide = charset.startswith(("utf-16", "utf-32"))
+    # every UTF-16 character of ASCII text carries a NUL: the binary sniff is
+    # only for the other encodings, or a declared UTF-16 page was refused
+    if raw.startswith(b"%PDF") or (not wide and b"\x00" in raw[:1024]):
+        raise WebError("that is a PDF or binary file; fetch_url can only read text and HTML")
+    if charset in _LATIN1_LABELS:
+        # What browsers do (WHATWG Encoding): these labels mean windows-1252,
+        # whose curly quotes and dashes otherwise became invisible C1 controls.
+        return raw.decode("cp1252", errors="replace")
     try:
         return raw.decode(charset, errors="replace")
     except (LookupError, ValueError):
@@ -259,14 +350,26 @@ def _decode(raw: bytes, ctype: str) -> str:
 
 
 class _Page(str):
-    """Page text that remembers the media type the server sent with it."""
+    """Page text that remembers the media type the server sent with it, and
+    whether the time limit cut it short."""
     media_type = ""
+    cut = False
 
 
-def _page(text: str, ctype: str) -> _Page:
+def _page(text: str, ctype: str, cut: bool = False) -> _Page:
     page = _Page(text)
     page.media_type = (ctype or "").split(";", 1)[0].strip().lower()
+    page.cut = cut
     return page
+
+
+def _shut(conn) -> None:
+    sock = getattr(conn, "sock", None)
+    if sock is not None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)       # wakes a recv blocked in another thread
+        except OSError:
+            pass
 
 
 def _open(url: str, *, accept: str) -> tuple[str, str]:
@@ -281,13 +384,13 @@ def _open(url: str, *, accept: str) -> tuple[str, str]:
     parts = urllib.parse.urlsplit(url)
     if _proxy_for(parts.scheme, parts.hostname or ""):
         # The user's proxy resolves the name; we can still refuse it up front.
-        check_url(url)
+        check_url(url, proxied=True)
         opener = urllib.request.build_opener(_GuardedRedirects())
         try:
             with opener.open(urllib.request.Request(url, headers=headers), timeout=TIMEOUT) as r:
                 raw = _read_capped(r, r.headers.get("Content-Encoding") == "gzip", deadline)
                 ctype = r.headers.get("Content-Type", "")
-                return r.geturl(), _page(_decode(raw, ctype), ctype)
+                return r.geturl(), _page(_decode(raw, ctype), ctype, raw.cut)
         except urllib.error.HTTPError as e:
             raise WebError(f"the site answered {e.code} {e.reason}") from e
         except urllib.error.URLError as e:
@@ -296,29 +399,44 @@ def _open(url: str, *, accept: str) -> tuple[str, str]:
             raise WebError(f"could not read it: {e}") from e
 
     for _hop in range(MAX_REDIRECTS + 1):
-        host, port, ip = _vet(url)
+        host, port, ips = _vet(url)
         p = urllib.parse.urlsplit(url)
         target = (p.path or "/") + (f"?{p.query}" if p.query else "")
         Conn = _Pinned.HTTPS if p.scheme == "https" else _Pinned.HTTP
-        conn = Conn(host, port, ip, TIMEOUT)
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise WebError(f"timed out after {DEADLINE}s")
+        conn = Conn(host, port, ips, min(TIMEOUT, left))
+        # The deadline covers the whole exchange, not just the body: a server
+        # trickling one header byte every few seconds held the turn for as
+        # long as it liked. At the deadline the socket is shut under it.
+        watchdog = threading.Timer(left, _shut, (conn,))
+        watchdog.daemon = True
+        watchdog.start()
         try:
             conn.request("GET", target, headers=headers)
             r = conn.getresponse()
             if r.status in (301, 302, 303, 307, 308) and r.getheader("Location"):
-                url = _normalize(urllib.parse.urljoin(url, r.getheader("Location")))
+                loc = r.getheader("Location")
+                try:
+                    loc = loc.encode("latin-1").decode("utf-8")   # raw UTF-8 sent as a header
+                except UnicodeError:
+                    pass
+                url = _normalize(urllib.parse.urljoin(url, loc))
                 continue
             if r.status >= 400:
                 raise WebError(f"the site answered {r.status} {r.reason}")
             raw = _read_capped(r, r.getheader("Content-Encoding") == "gzip", deadline)
             ctype = r.getheader("Content-Type", "")
-            return url, _page(_decode(raw, ctype), ctype)
+            return url, _page(_decode(raw, ctype), ctype, raw.cut)
         except WebError:
             raise
-        except (OSError, ssl.SSLError, http.client.HTTPException) as e:
-            if isinstance(e, (socket.timeout, TimeoutError)):
-                raise WebError(f"timed out after {TIMEOUT}s") from e
+        except (OSError, ssl.SSLError, http.client.HTTPException, ValueError, AttributeError) as e:
+            if time.monotonic() >= deadline or isinstance(e, (socket.timeout, TimeoutError)):
+                raise WebError(f"timed out after {DEADLINE}s") from e
             raise WebError(f"could not reach it: {e}") from e
         finally:
+            watchdog.cancel()
             conn.close()
     raise WebError(f"too many redirects (more than {MAX_REDIRECTS})")
 
@@ -334,6 +452,7 @@ _BLOCK = {"p", "div", "br", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "sec
           "article", "header", "main", "pre", "blockquote", "table", "ul", "ol", "dd",
           "dt", "hr", "figure", "figcaption", "summary", "details"}
 _MAIN = {"main", "article"}
+_HEAD_CONTENT = {"meta", "link", "title", "style", "script", "base", "noscript", "template"}
 
 
 class _Text(HTMLParser):
@@ -362,6 +481,16 @@ class _Text(HTMLParser):
             self.body = True
             if "head" in self.skip:
                 self.skip = [t for t in self.skip if t != "head"]   # an unclosed <head>
+        if self.skip == ["head"]:
+            if tag == "title":
+                self.skip.append("title")       # the tab title is not page text
+                return
+            if tag not in _HEAD_CONTENT:
+                # </head> and <body> are both optional: the first body tag
+                # ends the head, as in a browser. Before, such a page came
+                # back empty ("no readable text").
+                self.skip = []
+                self.body = True
         if tag == "head" and getattr(self, "body", False):
             return                      # browsers ignore a <head> inside <body>; so do we
         if tag in _SKIP:
@@ -373,6 +502,13 @@ class _Text(HTMLParser):
             self.main += 1
         if tag == "pre":
             self.pre += 1
+        if tag == "tr":
+            self.cells = 0
+        elif tag in ("td", "th"):
+            # cells side by side, or "timeout" and "30" read as "timeout30"
+            if getattr(self, "cells", 0):
+                self._emit(" | ")
+            self.cells = getattr(self, "cells", 0) + 1
         if tag in _BLOCK:
             self._emit("\n")
 
@@ -394,6 +530,9 @@ class _Text(HTMLParser):
             self.main -= 1
 
     def handle_data(self, data):
+        if self.skip == ["head"] and data.strip():
+            self.skip = []                      # text at head level: the body has begun
+            self.body = True
         if self.skip:
             return
         if self.pre:
@@ -575,6 +714,11 @@ def fetch(url: str, start: int = 0) -> str:
     else:
         is_html = bool(_LOOKS_HTML.search(raw[:4096]))
     text = html_to_text(raw) if is_html else raw.strip()
+    cut = getattr(raw, "cut", False)
     if not text.strip():
+        if cut:
+            raise WebError(f"timed out after {DEADLINE}s before the page arrived")
         raise WebError("that page had no readable text (it may be an app shell or a PDF)")
+    if cut:
+        text += f"\n\n[the page was cut off: it did not finish loading within {DEADLINE}s]"
     return wrap_untrusted(final, clip(text, start=start or 0))

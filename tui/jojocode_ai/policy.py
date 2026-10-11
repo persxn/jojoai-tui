@@ -26,6 +26,7 @@ tools are read-only instead of trusting the server's `destructive` flag.
 from __future__ import annotations
 
 import os
+import sys
 
 # Tools that cannot change anything on this machine or send anything off it.
 # fetch_url is not one of them: the model picks the URL, and a URL carries
@@ -76,4 +77,46 @@ def auto_write_ok(path: str, root: str) -> bool:
         parts = [x for x in rel.replace("\\", "/").split("/") if x not in ("", ".")]
         if any(x.startswith(".") or (_SHORT_NAMES and "~" in x) for x in parts):
             return False
+    if _SHORT_NAMES and os.path.splitext(path)[1].lower() in _WIN_RUNNABLE:
+        # cmd.exe runs these by bare name; a git.cmd written here unasked
+        # would be what "git status" runs next
+        return False
     return True
+
+
+_WIN_RUNNABLE = frozenset((os.environ.get("PATHEXT", "") or "").lower().split(";")) - {""} | {
+    ".bat", ".cmd", ".com", ".exe", ".js", ".jse", ".vbs", ".vbe", ".wsf", ".wsh", ".msc",
+    ".ps1", ".scr", ".pif", ".lnk"}
+
+
+# -- JojoAI's own data ------------------------------------------------------ #
+
+def _canon(p: str) -> str:
+    if os.name == "nt":
+        if p.startswith("\\\\?\\UNC\\"):
+            p = "\\\\" + p[8:]
+        elif p.startswith("\\\\?\\"):
+            p = p[4:]                           # \\?\C:\x is C:\x
+    p = os.path.normcase(os.path.realpath(p))
+    if sys.platform == "darwin":
+        p = p.casefold()                        # APFS is case-insensitive; normcase is not
+    return p
+
+
+def _protected() -> list[str]:
+    from .config import config_dir
+    data = os.environ.get("JOJO_DATA") or os.path.expanduser("~/.local/share/jojocode-ai")
+    return [_canon(data), _canon(config_dir())]
+
+
+def blocked(path: str) -> bool:
+    """`path` is inside JojoAI's own history or credentials (symlinks seen through).
+
+    Both modes refuse these. Remote mode used not to: with the project in the
+    home directory, read_file(".config/jojocode-ai/credentials") sent every
+    stored token to the server without a prompt."""
+    try:
+        rp = _canon(path)
+        return any(rp == d or rp.startswith(d.rstrip(os.sep) + os.sep) for d in _protected())
+    except (OSError, ValueError):
+        return False

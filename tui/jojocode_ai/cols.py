@@ -123,5 +123,21 @@ def visible(text: str) -> str:
     carriage return or any other control character is drawn as its symbol —
     a Windows path whose "\\t" became a real tab must not look like a path."""
     text = _ANSI.sub(lambda m: "␛" + m.group()[1:], text)
-    return "".join(c if c == "\n" or c >= " " and c != "\x7f" else
-                   ("␡" if c == "\x7f" else chr(0x2400 + ord(c))) for c in text)
+    out = []
+    for c in text:
+        if c == "\n" or (c >= " " and c != "\x7f" and not _HIDDEN(c)):
+            out.append(c)
+        elif c == "\x7f":
+            out.append("␡")
+        elif c < " ":
+            out.append(chr(0x2400 + ord(c)))
+        else:
+            # bidi overrides (U+202E) reorder what the terminal shows, and
+            # zero-width characters show nothing: name them instead
+            out.append(f"⟨U+{ord(c):04X}⟩")
+    return "".join(out)
+
+
+def _HIDDEN(c: str) -> bool:
+    """A format character (Cf) or a C1 control: invisible, or worse, on screen."""
+    return "\x80" <= c <= "\x9f" or unicodedata.category(c) == "Cf"

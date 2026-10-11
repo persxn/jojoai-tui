@@ -96,6 +96,14 @@ export interface SessionReadyMsg {
   seatNo: number;
   resumeToken: string; // store this; needed to rebind after a drop
   resumed: boolean; // true ⇒ this was a reconnect, replay may follow
+  /**
+   * Whether the session still has a turn running. A turn that finished while
+   * the client was away had its last deltas and turn_done sent into the dead
+   * socket; without this the resumed client waited for them forever.
+   */
+  turnActive?: boolean;
+  /** The model this server answers with (the client's --model does not apply). */
+  model?: string;
 }
 
 export interface QueuedMsg {
@@ -120,7 +128,7 @@ export interface ToolRequestMsg {
   id: string; // stable; the exactly-once key
   name: 'read_file' | 'list_dir' | 'write_file' | 'apply_patch' | 'run_command' | string;
   args: Record<string, unknown>;
-  timeoutMs: number;
+  timeoutMs: number; // time LEFT on the server's timer (less than the full window on a replay)
   destructive: boolean; // client MUST get explicit user approval when true (regardless of allowlist)
 }
 

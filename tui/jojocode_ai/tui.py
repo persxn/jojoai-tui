@@ -246,6 +246,7 @@ class TUI:
         self._btw: list[str] = []
         self._queued: list[str] = []    # messages sent while busy
         self._kill = ""                 # Ctrl-U / W / K buffer, for Ctrl-Y
+        self._carry: list = []          # an escape sequence cut off at the end of a read
         self._armed: tuple[str, float] = ("", 0.0)   # a two-press action awaiting its second
         self._surrogate = ""            # half of a non-BMP character (Windows)
         self._in_paste = False          # between bracketed-paste markers
@@ -322,6 +323,11 @@ class TUI:
         """
         from .config import load_settings, settings_path
 
+        if getattr(self.cfg, "remote_endpoint", None):
+            # The server answers with its own model; switching here changed
+            # only the label in the header.
+            self._toast_msg(f"in remote mode the server picks the model ({self.cfg.model})")
+            return
         words = arg.split()
         save = False
         for flag in ("--save", "-s"):
@@ -730,10 +736,9 @@ class TUI:
             body = _visible(body)
             if k in ("path", "url", "cwd"):
                 body = body.replace("\n", "␊")      # a path has no line breaks to show
+            # all of it: the panel scrolls (PgUp/PgDn), and a 60-line cap let
+            # line 61 of a .bashrc or a git hook be approved unseen
             lines = body.split("\n")
-            if k == "content" and len(lines) > 60:
-                extra = len(lines) - 60
-                lines = lines[:60] + [f"… {extra} more lines ({len(body)} chars in all)"]
             out.append(f"{k}:")
             for ln in lines:
                 out.extend("  " + piece for piece in _wrap(ln, w - 2))
@@ -781,6 +786,9 @@ class TUI:
             sub += " · edits files"
         else:
             sub += " · asks first"
+        always = sorted(t for t in self.cfg.auto_approve if t != "*")
+        if always and "*" not in self.cfg.auto_approve:
+            sub += " · always: " + ",".join(always)     # an "a a" grant, not hidden
         if self.store is not None and getattr(self.store, "rag_enabled", False):
             sub += " · recall ON"
         else:
@@ -919,7 +927,7 @@ class TUI:
 
     def _toggle_yolo(self):
         if "*" in self.cfg.auto_approve:
-            self.cfg.auto_approve.discard("*")
+            self.cfg.auto_approve.clear()     # and every "always" granted: the toast says so
             self._toast_msg("YOLO off — tools will ask")
         else:
             self.cfg.auto_approve.add("*")
@@ -957,6 +965,7 @@ class TUI:
                     self.store = Store(self.cfg.host, self.cfg.embed_model, old.rag_enabled,
                                        api=getattr(self.agent.client, "api", "ollama"))
                     self.agent.store = self.store
+                    old.close()             # each reset used to leak a thread and a database
                 except Exception:  # noqa: BLE001
                     pass
             self._append("info", "fresh chat — nothing carried over")
@@ -996,7 +1005,13 @@ class TUI:
             self._toggle_yolo()
         elif cmd == "/trust":
             self.cfg.auto_bash = not self.cfg.auto_bash
-            self.cfg.auto_edit = True
+            if self.cfg.auto_bash:
+                self._edit_before_trust = self.cfg.auto_edit
+                self.cfg.auto_edit = True
+            else:
+                # back to what it was: --safe used to be lost for good
+                self.cfg.auto_edit = getattr(self, "_edit_before_trust", self.cfg.auto_edit)
+                self.cfg.auto_approve.discard("run_bash")
             self._toast_msg("shell commands run without asking"
                             if self.cfg.auto_bash else "shell commands will ask again")
         elif cmd == "/btw":
@@ -1134,7 +1149,7 @@ class TUI:
         if k.startswith("del:") and time.time() - t < ARM_SECS:
             head = f"press d again to DELETE {k[4:]} · any other key cancels"
         else:
-            head = "chat history   ↑↓ move · Enter view · Ctrl-O resume · d delete · Esc close"
+            head = "chat history   ↑↓ move · Enter view · Ctrl-O resume · d then y delete · Esc close"
         self._safe(stdscr, top, 1, head, A["hint"], w)
         view_h = max(1, h - top - 3)
         first = max(0, min(sel - view_h // 2, max(0, len(rows) - view_h)))
@@ -1158,7 +1173,7 @@ class TUI:
         self._append("info", f"─── history {sid} · {len(msgs)} msgs · read-only, "
                              f"NOT added to this chat's context ───")
         for m in msgs:
-            self._append("user" if m["role"] == "user" else "assistant", m["content"])
+            self._append("user" if m["role"] == "user" else "assistant", _clean(m["content"]))
         self._append("info", "─── end of history · /reset for a clean slate ───")
         self.scroll = 0
         self._toast_msg(f"viewing {sid}")
@@ -1182,7 +1197,7 @@ class TUI:
         self._clear_input()
         for m in msgs:
             self.agent.messages.append({"role": m["role"], "content": m["content"]})
-            self._append("user" if m["role"] == "user" else "assistant", m["content"])
+            self._append("user" if m["role"] == "user" else "assistant", _clean(m["content"]))
         self.last_user = next((m["content"] for m in reversed(msgs)
                                if m["role"] == "user"), None)
         self.scroll = 0
@@ -1310,6 +1325,8 @@ class TUI:
         """Keys → tokens: surrogate pairs joined, escape sequences curses did
         not know decoded or dropped (they used to be typed into the input)."""
         out: list = []
+        keys = self._carry + list(keys)
+        self._carry = []
         i = 0
         while i < len(keys):
             ch = keys[i]
@@ -1326,11 +1343,19 @@ class TUI:
             if ch == "\x1b" and i < len(keys) and keys[i] in ("[", "O"):
                 seq = keys[i]
                 j = i + 1
+                done = False
                 while j < len(keys) and isinstance(keys[j], str) and len(seq) < 16:
                     seq += keys[j]
                     j += 1
                     if "@" <= seq[-1] <= "~" and len(seq) > 1:
+                        done = True
                         break
+                if not done and j >= len(keys) and len(seq) < 16:
+                    # The batch ended inside the sequence (a slow link): keep
+                    # it for the next one. Dropped, an end-of-paste marker
+                    # left the input in paste mode for good.
+                    self._carry = keys[i - 1:]
+                    break
                 i = j
                 tok = _ESCAPES.get(seq)
                 if tok is not None:
@@ -1356,14 +1381,17 @@ class TUI:
             if t == "</paste>":
                 self._in_paste = False
                 continue
-            if self.pending_approval and (self._in_paste or pasted) and isinstance(t, str) \
+            if (self.pending_approval or self.picker is not None) \
+                    and (self._in_paste or pasted) and isinstance(t, str) \
                     and (t.isprintable() or t in ("\r", "\n", "\t")):
                 # A paste is never an answer: "yes" pasted here allowed the
-                # command, and any "aa" in it granted "always". Ctrl-C and the
-                # scroll keys still reach the prompt.
+                # command, and any "aa" in it granted "always"; in the history
+                # browser a pasted "dy" deleted a chat. Ctrl-C and the scroll
+                # keys still get through.
                 if not ignored_paste:
                     ignored_paste = True
-                    self._toast_msg("paste ignored — answer the approval with y / n / a")
+                    self._toast_msg("paste ignored — answer the approval with y / n / a"
+                                    if self.pending_approval else "paste ignored")
                 continue
             literal = (self._in_paste or pasted) and not self.pending_approval \
                 and self.picker is None and self._splash_done
@@ -1390,6 +1418,16 @@ class TUI:
                 pass
             return False
 
+        if ch == curses.KEY_RESIZE:
+            # before the approval / picker / splash routing, which swallowed
+            # it: PDCurses kept drawing at the old size until the next resize
+            if IS_WINDOWS:
+                try:
+                    curses.resize_term(0, 0)
+                except curses.error:
+                    pass
+            self._redraw = True
+            return False
         if ch == "\x1b" + "ESC":
             ch = "\x1b"
         # decoded escape sequences arrive as "<home>"/"<end>" strings; as
@@ -1554,6 +1592,7 @@ class TUI:
     def _approval_key(self, ch) -> bool:
         if ch == "\x03":                                # Ctrl-C: deny, and stop
             self.agent.interrupt()
+            self._queued.clear()          # "Ctrl-C drops it": it used to start a new turn
             self._answer(False)
             self._toast_msg("interrupt requested")
             return False
@@ -1591,9 +1630,15 @@ class TUI:
         pk = self.picker
         sid = pk["rows"][pk["sel"]][0]
         if ch in ("d", "D", curses.KEY_DC):
-            # one keypress used to delete a chat for good
-            if self._arm("del:" + sid):
-                self._delete_session(sid)
+            # Arm with d, confirm with y — never d twice: "add", "middleware",
+            # any word with "dd" typed here deleted the highlighted chat.
+            self._armed = ("del:" + sid, time.time())
+            self._toast_msg("press y to delete this chat for good · any other key keeps it")
+            return False
+        if ch in ("y", "Y") and self._armed[0] == "del:" + sid \
+                and time.time() - self._armed[1] < ARM_SECS:
+            self._armed = ("", 0.0)
+            self._delete_session(sid)
             return False
         self._armed = ("", 0.0)
         if ch in ("\x1b", "q", "Q", "\x12", "\x03"):  # Esc / q / Ctrl-R / Ctrl-C
@@ -1654,6 +1699,7 @@ class TUI:
         self._append("info", f"=^..^=  {random.choice(MEOWS)}")
 
         last = time.time()
+        was_animating = True
         while True:
             dirty = self._drain() or self._dirty
             self._dirty = False
@@ -1670,12 +1716,19 @@ class TUI:
                     self.cat_frame += 1
                     self._last_cat = now
                 dirty = True
+            elif was_animating:
+                dirty = True        # one last frame: an expired toast stayed up for good
+            was_animating = animating
             last = now
             if dirty:
                 self._draw(stdscr)
 
             keys = self._read_keys(stdscr, 33 if animating else 500)
             if not keys:
+                if self._carry:
+                    self._carry = []          # the rest of that sequence never came
+                if self._in_paste and time.time() - self._last_activity > 1.0:
+                    self._in_paste = False    # an end-of-paste marker that was lost
                 continue
             self._last_activity = time.time()
             self._dirty = True

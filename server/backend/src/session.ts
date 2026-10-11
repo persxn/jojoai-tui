@@ -37,7 +37,7 @@ export interface Session {
   turnActive: boolean;
   abort: AbortController | null;
 
-  pendingTools: Map<string, { name: string; args: Record<string, unknown> }>;
+  pendingTools: Map<string, { name: string; args: Record<string, unknown>; dispatchedAt: number }>;
   toolResults: Map<string, ToolResultPayload>;
   toolWaiters: Map<string, ToolWaiter>;
 

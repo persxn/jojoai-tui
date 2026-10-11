@@ -706,7 +706,31 @@ def test_approval_after_the_server_stopped_waiting_is_not_run(project, ws, agent
     assert results[0]["ok"] is False and results[0]["refused"] == "timeout"
     assert kinds(events, "tool_start") == []
     assert any("too late" in e[1] for e in kinds(events, "info"))
-    assert agent.journal["late"]["refused"] == "timeout"    # a replay must not run it either
+
+
+def test_a_late_approval_replayed_in_the_same_turn_is_not_run(project, ws, agents):
+    # The refusal is journaled: the same request replayed before turn_done
+    # (a reconnect) is answered from the journal, never run or asked again.
+    results: list[dict] = []
+    req = tool_request("late", "run_command", {"cmd": "echo ran > marker.txt"},
+                       destructive=True, timeout_ms=1500)
+
+    def handler(peer):
+        ready(peer)
+        peer.expect("user_turn")
+        peer.send(req)
+        results.append(peer.expect("tool_result"))
+        peer.send(req)                                  # replayed
+        results.append(peer.expect("tool_result"))
+        peer.send(turn_done())
+        peer.drain()
+
+    ask = Approver(answer=True, delay=0.8)
+    agent = agents(ws(handler), project, approver=ask)
+    list(agent.run("run it"))
+    assert len(ask.calls) == 1
+    assert [r["refused"] for r in results] == ["timeout", "timeout"]
+    assert not (project / "marker.txt").exists()
 
 
 @pytest.mark.parametrize("args", ["path=.", ["."], None, 42])
@@ -814,7 +838,7 @@ def test_journal_is_per_turn(project, ws, agents):
     list(agent.run("read b"))
     assert [r.get("content") for r in results] == ["AAA", "BBB"], \
         "turn 2 was answered from turn 1's journal"
-    assert list(agent.journal) == ["1"] and agent.journal["1"]["content"] == "BBB"
+    assert agent.journal == {}      # a finished turn's requests can no longer be replayed
 
 
 def test_replayed_request_is_answered_from_journal_not_rerun(project, ws, agents):

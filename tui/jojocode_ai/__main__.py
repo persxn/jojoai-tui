@@ -182,7 +182,7 @@ def main(argv=None):
                          "input) — starting the plain REPL instead. For the full TUI use "
                          "Windows Terminal or cmd, or run: winpty jojo\n")
         from .headless import run as run_headless
-        return run_headless(cfg, None)
+        return run_headless(cfg, None, interactive=True)
 
     try:
         import curses  # noqa: F401

@@ -55,11 +55,14 @@ def _c(key, text):
     return f"{C[key]}{text}{C['reset']}"
 
 
-def _approver(cfg: Config):
+def _approver(cfg: Config, interactive: bool = False):
     def ask(name, args):
         if cfg.approves(name):
             return True
-        if not sys.stdin.isatty():
+        # `interactive`: the Git Bash / mintty fallback, where stdin is a pipe
+        # but a person is typing — auto-denying there meant no command could
+        # ever run. Real pipes and one-shot scripts still deny.
+        if not (interactive or sys.stdin.isatty()):
             print(_c("yellow", f"[auto-deny {name} - no TTY to confirm]"))
             return False
         # The whole request, never a 200-character preview: what is cut off
@@ -67,9 +70,7 @@ def _approver(cfg: Config):
         print(_c("yellow", f"\nAllow {name}?"))
         for k, v in (args or {}).items():
             body = visible(v if isinstance(v, str) else repr(v))
-            lines = body.split("\n")
-            if k == "content" and len(lines) > 60:
-                lines = lines[:60] + [f"… {len(lines) - 60} more lines"]
+            lines = body.split("\n")          # all of it: what is cut is what goes unseen
             print(_c("yellow", f"  {k}:"))
             for ln in lines:
                 print("    " + ln)
@@ -117,6 +118,8 @@ def _render(agent: Agent, text: str) -> bool:
             print(_c("dim", f"· recalled {ev[1]} snippet(s) from earlier chats"))
         elif kind == "info":
             print(_c("dim", f"· {clean(ev[1])}"))
+            if len(ev) > 2 and ev[2] == "truncated":
+                failed = True               # half an answer is not a successful run
         elif kind == "tool_denied":
             print(_c("red", f"✗ denied: {ev[1]}"))
         elif kind == "final":
@@ -146,7 +149,7 @@ def _short(args):
     return s if len(s) < 120 else s[:120] + "…"
 
 
-def run(cfg: Config, one_shot: str | None = None):
+def run(cfg: Config, one_shot: str | None = None, interactive: bool = False):
     # Piped or redirected on Windows, stdout is cp1252 and the first "→" this
     # prints raised UnicodeEncodeError — in the mode meant for scripting.
     for stream in (sys.stdout, sys.stderr):
@@ -154,7 +157,7 @@ def run(cfg: Config, one_shot: str | None = None):
             stream.reconfigure(errors="replace")
         except (AttributeError, ValueError):
             pass
-    agent = Agent(cfg, approver=_approver(cfg))
+    agent = Agent(cfg, approver=_approver(cfg, interactive and one_shot is None))
     try:
         from .store import Store
         agent.store = Store(cfg.host, cfg.embed_model, cfg.rag,

@@ -100,11 +100,24 @@ the curses UI in a real pty, Windows behaviour with `os.name` patched.
 3. Publish the 0.3.0 wheel and update `dist/dl/tui-wheel` (see `tui/README.md`)
    — until then the installer keeps handing out 0.2.1.
 
-### Server: one fix, not yet deployed
-- `orchestrator.ts` reported a reply cut off by the model's length limit as
-  `stopReason: 'max_wallclock'`, which the TUI shows as the server's time
-  limit. Now `max_tokens` (protocol and client updated; older clients ignore
-  `stopReason`). Live only after the backend is redeployed.
+### Server: fixes made, not yet deployed (redeploy the backend)
+All backward compatible: older clients ignore the new fields.
+- `stopReason: 'max_tokens'` for a reply cut off by the model's length limit
+  (it was reported as `max_wallclock`, the server's time limit).
+- `session_ready` says `turnActive` and `model`: a turn that finished while
+  the client was disconnected used to leave the resumed client waiting
+  forever, and the header showed the client's --model, not the server's.
+- A replayed `tool_request` carries the time left on its timer, not a fresh
+  full window (a late approval ran a command the model had been told did not).
+- A socket's late `close` no longer detaches a session that already resumed on
+  a new socket (all further output of that session was being dropped).
+
+### Second review round (48 findings) — fixed, `test_review_round2.py`
+The worst: remote mode could read JojoAI's credentials unasked; a remote tool
+could run twice after a reconnect; on Windows cmd.exe ran a `git.cmd` the
+model had written into the project when the user approved `git status`; "dd"
+typed in the history browser deleted a chat; fetch_url could be stalled
+indefinitely by a slow server.
 
 ---
 

@@ -108,6 +108,15 @@ def _post(url: str, body: dict, timeout: int = 20) -> tuple[int, dict]:
         raise RuntimeError(f"cannot reach {url}: {e}") from e
 
 
+def _read_code() -> str:
+    # getpass on Windows talks to the console directly; under Git Bash
+    # (mintty) that console is hidden, so the prompt never showed and the
+    # login hung. A pipe gets a plain prompt (the code is single-use).
+    if os.name == "nt" and not sys.stdin.isatty():
+        return input("code: ").strip()
+    return getpass.getpass("code: ").strip()
+
+
 def otp_login(endpoint: str, email: str | None = None,
               code: str | None = None) -> str:
     """Interactive email + OTP. Returns a token and persists it."""
@@ -127,7 +136,7 @@ def otp_login(endpoint: str, email: str | None = None,
     print("a 6-digit code was sent if that address is registered.", file=sys.stderr)
 
     try:
-        otp = code or getpass.getpass("code: ").strip()
+        otp = code or _read_code()
     except (EOFError, KeyboardInterrupt):
         raise RuntimeError("login cancelled") from None
     status, data = _post(f"{endpoint}/api/auth/otp/verify", {"email": email, "code": otp})

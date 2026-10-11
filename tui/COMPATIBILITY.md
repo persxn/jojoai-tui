@@ -134,10 +134,10 @@ arriving in one read are treated as a paste. Pasted tabs become four spaces;
 Windows CRLF becomes one newline.
 
 **Approval prompt.** The panel shows the whole request — the full command,
-path and working directory, an edit's old and new text, the first 60 lines of
-a new file's content with the rest counted — with control characters made
-visible (`␊`, `␛`) so nothing can hide after a newline or behind an escape
-sequence. Keys typed in the first moment after it appears are ignored, so a
+path and working directory, an edit's old and new text, a new file's whole
+content (scroll with `PgUp`/`PgDn`) — with control characters made visible
+(`␊`, `␛`, and bidi or zero-width characters as `⟨U+202E⟩`) so nothing can hide
+after a newline, behind an escape sequence or in a reordered line. Keys typed in the first moment after it appears are ignored, so a
 keystroke meant for the input box cannot approve it, and a paste never answers
 it. `y` once, `n`/`Esc` deny,
 `a` then `a` again within three seconds to always allow that tool for the
@@ -164,7 +164,10 @@ On Windows, two cmd.exe limits are refused before you are asked to approve
 anything, with what to do instead: a multi-line command (cmd.exe would run only
 the first line) and a project on a network (UNC) path (cmd.exe would silently
 run in `C:\Windows`). Commands run without a console window of their own, so
-nothing flashes up or steals the keyboard.
+nothing flashes up or steals the keyboard, and cmd.exe does not look in the
+project folder before PATH (a `git.cmd` there is not what `git` runs). Files
+cmd.exe would run by name (`.cmd`, `.bat`, `.ps1`, `.exe`, `.js`, …) always ask
+before they are written. UTF-16 output (`wsl -l`, `wmic`) is decoded.
 
 ## Files the agent reads and writes
 

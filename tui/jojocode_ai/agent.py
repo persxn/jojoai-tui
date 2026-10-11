@@ -369,7 +369,8 @@ class Agent:
             if got_error and not (assistant_text or tool_calls):
                 break
             if stats.get("done_reason") == "length":
-                yield ("info", "the reply was cut off: it reached the context limit")
+                # third field: a script (headless) must not take half an answer for one
+                yield ("info", "the reply was cut off: it reached the context limit", "truncated")
 
             if not tool_calls and not answer.strip():
                 if not nudged:
@@ -416,6 +417,10 @@ class Agent:
                     continue
 
                 if name == "run_bash":
+                    if isinstance(args.get("command"), (list, tuple)):
+                        # the user approves the exact string the shell will run,
+                        # not a list whose quoting the shell reads differently
+                        args = dict(args, command=shell.as_command(args["command"]))
                     why = shell.precheck(args.get("command", ""), self.ctx.cwd)
                     if why:
                         # never ask the user to approve what cannot run here

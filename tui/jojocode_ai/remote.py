@@ -41,12 +41,13 @@ without re-running the side effect.
 
 from __future__ import annotations
 
+import os
 import platform
 import threading
 import time
 from types import SimpleNamespace
 
-from . import __version__, policy, remote_exec
+from . import __version__, policy, remote_exec, shell
 from .config import Config
 from .wsjson import WSClient, WSClosed, WSError
 
@@ -109,6 +110,10 @@ class RemoteAgent:
         self.resume_token: str | None = None
         self.seat = 0
         self.journal: dict[str, dict] = {}
+        self._server_turn: bool | None = None
+        self._last_session = ""          # the session the previous turn ran on
+        self._inbox: list = []           # (time received, frame) read ahead of handling
+        self._deadline: dict[str, float] = {}   # tool id -> when the server stops waiting
 
     # -- TUI-facing control ------------------------------------------- #
     def interrupt(self) -> None:
@@ -119,6 +124,9 @@ class RemoteAgent:
         self._hard_close()
         self.resume_token = None
         self.journal.clear()
+        self._deadline.clear()
+        self._inbox.clear()
+        self._last_session = ""
         self.messages.clear()
 
     def set_cwd(self, path: str) -> None:
@@ -145,8 +153,8 @@ class RemoteAgent:
         if w:
             try:
                 w.close()
-            except OSError:
-                pass
+            except (WSError, OSError):
+                pass        # it raised on a dead socket: /reset crashed, resume never ran
 
     def _connect(self, *, resume: bool) -> None:
         ws = WSClient(ws_url(self.endpoint))
@@ -176,6 +184,12 @@ class RemoteAgent:
         self.session_id = msg.get("sessionId", "")
         self.resume_token = msg.get("resumeToken")
         self.seat = msg.get("seatNo", 0)
+        # None from a server too old to say; False means a turn we were
+        # waiting on finished while we were away (its turn_done is lost)
+        self._server_turn = msg.get("turnActive")
+        if isinstance(msg.get("model"), str) and msg["model"]:
+            # The server answers with its own model; --model does not apply.
+            self.cfg.model = self.client.model = msg["model"]
         self._start_heartbeat()
 
     def _ensure(self) -> None:
@@ -196,6 +210,7 @@ class RemoteAgent:
                 if e.code in (RESUME_EXPIRED, IDLE_CLOSED) and self.resume_token:
                     self.resume_token = None
                     self.journal.clear()
+                    self._deadline.clear()
                     try:
                         self._connect(resume=False)
                     except (WSError, OSError):
@@ -234,7 +249,10 @@ class RemoteAgent:
     def run(self, text: str):
         self._interrupt = False
         self._turn_active = True
-        self.journal.clear()               # replays only ever concern the current turn
+        # The journal is NOT cleared here: a turn this client gave up on may
+        # still be running on the server, which replays its unanswered
+        # requests on the next connection — clearing ran them a second time.
+        # It is cleared when a turn_done arrives, on a fresh session, and on /reset.
         yield ("user", text)
         self.messages.append({"role": "user", "content": text})
         try:
@@ -242,6 +260,8 @@ class RemoteAgent:
         finally:
             self._turn_active = False
             self._last_turn = time.monotonic()
+            if self.session_id:
+                self._last_session = self.session_id
         yield ("turn_end",)
 
     def _send(self, frame: dict) -> bool:
@@ -260,6 +280,8 @@ class RemoteAgent:
         except (WSError, WSClosed, OSError) as e:
             if isinstance(e, WSClosed) and e.code in (RESUME_EXPIRED, IDLE_CLOSED):
                 self.resume_token = None
+                self.journal.clear()
+                self._deadline.clear()
                 try:
                     self._connect(resume=False)
                 except (WSError, OSError) as e2:
@@ -268,6 +290,12 @@ class RemoteAgent:
             else:
                 yield ("error", f"cannot connect to {self.endpoint}: {e}")
                 return
+        if self._last_session and self.session_id != self._last_session:
+            # The TUI still shows the whole conversation; the model has none of it.
+            yield ("info", "the server had released the previous session, so this message "
+                           "starts a new conversation there — earlier messages are only on "
+                           "your screen")
+            self._last_session = self.session_id
 
         if not self._send({"t": "user_turn", "text": text}):
             try:
@@ -279,9 +307,11 @@ class RemoteAgent:
                 return
 
         streamed = False
+        waiting_for_old_turn = False
         last_rx = time.monotonic()
         interrupted_at = None
         last_sent = 0.0
+        self._inbox.clear()
         while True:
             now = time.monotonic()
             if self._interrupt:
@@ -292,7 +322,7 @@ class RemoteAgent:
                     last_sent = now
                 if now - interrupted_at > INTERRUPT_GRACE:
                     yield ("error", "interrupted (the server did not confirm in time; "
-                                    "the next message starts on a fresh connection)")
+                                    "the next message reconnects)")
                     self._hard_close()
                     return
             ws = self._ws
@@ -300,9 +330,13 @@ class RemoteAgent:
                 yield ("error", "connection closed")
                 return
             try:
-                msg = ws.recv_json(timeout=0.5)
-                if msg is None and time.monotonic() - last_rx > LIVENESS:
-                    raise WSClosed(reason="no word from the server")
+                if self._inbox:
+                    rx_at, msg = self._inbox.pop(0)
+                else:
+                    msg = ws.recv_json(timeout=0.5)
+                    rx_at = time.monotonic()
+                    if msg is None and rx_at - last_rx > LIVENESS:
+                        raise WSClosed(reason="no word from the server")
             except WSClosed as e:
                 if self._interrupt:
                     yield ("error", "interrupted")
@@ -310,6 +344,16 @@ class RemoteAgent:
                     return
                 try:
                     if self._reconnect():
+                        if self._server_turn is False:
+                            # It finished while we were away; its last words and
+                            # turn_done went into the dead socket. Waiting for
+                            # them would spin forever.
+                            yield ("error", "the connection dropped and the end of this reply "
+                                            "was lost — the server finished the turn while "
+                                            "it was down")
+                            self.journal.clear()
+                            self._deadline.clear()
+                            return
                         yield ("info", "connection dropped — resumed")
                         last_rx = time.monotonic()
                         continue
@@ -338,6 +382,8 @@ class RemoteAgent:
                 streamed = True
                 yield ("assistant", msg.get("text", ""))
             elif t == "tool_request":
+                self._note_deadline(msg, rx_at)
+                self._read_ahead(ws)
                 yield from self._tool(msg)
             elif t == "replay_begin":
                 yield ("info", f"reconnected — replaying {msg.get('count', 0)} tool call(s)")
@@ -348,6 +394,16 @@ class RemoteAgent:
                 self.session_id = msg.get("sessionId", self.session_id)
                 self.resume_token = msg.get("resumeToken", self.resume_token)
             elif t == "turn_done":
+                self.journal.clear()          # this turn's requests can no longer replay
+                self._deadline.clear()
+                if waiting_for_old_turn and not self._interrupt:
+                    # The turn the server was still running is over: now ours.
+                    waiting_for_old_turn = streamed = False
+                    if not self._send({"t": "user_turn", "text": text}):
+                        yield ("error", "connection lost before your message could be sent")
+                        return
+                    yield ("info", "sending your message now")
+                    continue
                 u = msg.get("usage", {}) or {}
                 yield ("stats", {
                     "prompt_eval_count": u.get("tokensIn"),
@@ -366,6 +422,14 @@ class RemoteAgent:
                 self.messages.append({"role": "assistant", "content": ""})
                 return
             elif t == "error":
+                if "already in progress" in str(msg.get("message", "")) and not waiting_for_old_turn:
+                    # A turn this client gave up on is still running there, and
+                    # the server refused ours. Used to be dropped, with the old
+                    # turn's ending shown as the answer to this message.
+                    waiting_for_old_turn = True
+                    yield ("info", "the server is still finishing the previous turn (below); "
+                                   "your message is sent when it ends")
+                    continue
                 yield ("error", f"{msg.get('code', 'error')}: {msg.get('message', '')}")
             elif t == "closing":
                 yield ("error", msg.get("reason", "server closing the session"))
@@ -375,6 +439,33 @@ class RemoteAgent:
                 return
             # heartbeat_ack, replay_end: nothing to do
 
+    def _read_ahead(self, ws) -> None:
+        """Take every frame already waiting, stamped with when it arrived.
+
+        The server sends a batch of tool requests at once and starts every
+        one's timer then; handling them one by one, the second was timed from
+        when the user finished approving the first — and ran after the
+        server had told the model it did not."""
+        try:
+            while True:
+                more = ws.recv_json(timeout=0)
+                if more is None:
+                    return
+                at = time.monotonic()
+                if isinstance(more, dict) and more.get("t") == "tool_request":
+                    self._note_deadline(more, at)
+                self._inbox.append((at, more))
+        except (WSError, OSError):
+            return      # the main loop meets the same error on its next read
+
+    def _note_deadline(self, msg: dict, at: float) -> None:
+        """When the server stops waiting for this request. timeoutMs is the
+        time left on its timer (less than the full window on a replay); a
+        repeat of an id keeps the earliest deadline seen."""
+        tid = str(msg.get("id", ""))
+        left = max(0.0, remote_exec._millis(msg.get("timeoutMs"), 120_000) / 1000)
+        self._deadline[tid] = min(self._deadline.get(tid, float("inf")), at + left)
+
     # -- tools ---------------------------------------------------- #
     def _pre_approved(self, name: str, args: dict) -> bool:
         if self.cfg.approves(name):
@@ -382,8 +473,14 @@ class RemoteAgent:
         if name == "run_command":
             return self.cfg.auto_bash
         if name == "write_file" and self.cfg.auto_edit:
-            full = remote_exec._jail(self.ctx.cwd, args.get("path"))
-            return full is not None and policy.auto_write_ok(full, self.ctx.cwd)
+            root = self.ctx.cwd
+            if remote_exec._jail(root, args.get("path")) is None:
+                return False
+            # As named, not as resolved: `.envrc -> config/envrc` is still a
+            # write to .envrc (auto_write_ok resolves it again itself), and a
+            # SUBST or mapped drive resolves to a volume the root is not on.
+            named = os.path.normpath(os.path.join(root, remote_exec._clean_path(args.get("path"))))
+            return policy.auto_write_ok(named, root)
         return False
 
     def _refuse(self, tid: str, name: str, why: str, refused: str = "user_rejected"):
@@ -397,10 +494,10 @@ class RemoteAgent:
         args = msg.get("args")
         if not isinstance(args, dict):
             args = {}
-        # parsed, not divided: a string or object here used to raise out of
-        # run() and leave the server waiting for a result that never came
-        budget = max(1.0, remote_exec._millis(msg.get("timeoutMs"), 120_000) / 1000)
-        t0 = time.monotonic()
+        deadline = self._deadline.get(tid)
+        if deadline is None:
+            self._note_deadline(msg, time.monotonic())
+            deadline = self._deadline[tid]
 
         if tid in self.journal:  # exactly-once on replay — no re-execution
             self._send_result(tid, self.journal[tid])
@@ -409,6 +506,19 @@ class RemoteAgent:
             self._refuse(tid, name, "interrupted by the user")
             yield ("tool_denied", name)
             return
+        if name == "run_command":
+            for key in ("cmd", "command"):
+                if isinstance(args.get(key), (list, tuple)):
+                    args = dict(args, **{key: shell.as_command(args[key])})   # approve what runs
+            # cmd.exe limits are refused before anyone is asked to approve
+            why = shell.precheck(shell.as_command(args.get("cmd") or args.get("command") or ""),
+                                 self.ctx.cwd)
+            if why:
+                payload = {"ok": False, "error": why}
+                self.journal[tid] = payload
+                self._send_result(tid, payload)
+                yield ("tool_end", name, remote_exec.summarize(name, payload))
+                return
 
         needs_ok = bool(msg.get("destructive")) or name not in policy.READ_ONLY
         if needs_ok and not self._pre_approved(name, args):
@@ -416,7 +526,7 @@ class RemoteAgent:
                 self._refuse(tid, name, "the user declined")
                 yield ("tool_denied", name)
                 return
-            if time.monotonic() - t0 > budget - 1:
+            if time.monotonic() > deadline - 1:
                 self._refuse(tid, name, "approved after the server stopped waiting; not run",
                              refused="timeout")
                 yield ("info", f"{name} was approved too late — the server had already "
@@ -425,7 +535,7 @@ class RemoteAgent:
 
         if name == "run_command":
             # finish, or be killed, inside the server's window
-            left_ms = max(1000, int((budget - (time.monotonic() - t0) - 2) * 1000))
+            left_ms = max(1000, int((deadline - time.monotonic() - 2) * 1000))
             args = dict(args, timeout_ms=min(int(remote_exec._millis(args.get("timeout_ms"), 120_000)),
                                              left_ms))
         yield ("tool_start", name, args)

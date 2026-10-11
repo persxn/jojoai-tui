@@ -520,22 +520,31 @@ def test_history_up_and_down_restore_the_unsent_draft(ui):
 # the history picker
 # --------------------------------------------------------------------------- #
 
-def test_picker_delete_needs_two_presses(ui):
+def test_picker_delete_needs_d_then_y(ui):
     rows = [("ses_20260101-120000", 2, "a"), ("ses_20260102-130000", 4, "b")]
     ui.store = FakeStore(rows)
     ui._open_picker()
 
     ui._handle_keys(["d"])
+    ui._handle_keys(["d"])                                # "dd" in a typed word: no delete
     assert ui.store.deleted == []
-    ui._handle_keys(["d"])
+    ui._handle_keys(["y"])
     assert ui.store.deleted == ["ses_20260101-120000"]
     assert [r[0] for r in ui.picker["rows"]] == ["ses_20260102-130000"]
 
     ui._handle_keys(["d"])
     ui._handle_keys(["x"])                                # any other key disarms
-    ui._handle_keys(["d"])
+    ui._handle_keys(["y"])
     assert ui.store.deleted == ["ses_20260101-120000"]
     assert ui.picker is not None
+
+
+def test_a_paste_in_the_picker_deletes_nothing(ui):
+    ui.store = FakeStore([("ses_20260101-120000", 2, "a")])
+    ui._open_picker()
+    ui._handle_keys(list("middleware dy"))
+    ui._handle_keys(list("\x1b[200~dy\x1b[201~"))
+    assert ui.store.deleted == []
 
 
 # --------------------------------------------------------------------------- #

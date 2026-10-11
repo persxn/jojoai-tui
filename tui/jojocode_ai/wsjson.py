@@ -143,7 +143,7 @@ class WSClient:
 
     def _tunnel(self, proxy: str, host: str, port: int) -> socket.socket:
         p = urllib.parse.urlsplit(proxy if "://" in proxy else "http://" + proxy)
-        sock = socket.create_connection((p.hostname, p.port or 8080), timeout=self.connect_timeout)
+        sock = socket.create_connection((p.hostname, p.port or (443 if p.scheme == "https" else 80)), timeout=self.connect_timeout)
         lines = [f"CONNECT {host}:{port} HTTP/1.1", f"Host: {host}:{port}"]
         if p.username:
             cred = f"{urllib.parse.unquote(p.username)}:{urllib.parse.unquote(p.password or '')}"
@@ -168,8 +168,8 @@ class WSClient:
         self._closed = True
         try:
             self._send_frame(OP_CLOSE, struct.pack(">H", code))
-        except OSError:
-            pass
+        except (OSError, WSError):
+            pass        # a dead socket turns the send into WSClosed; closing must not raise
         try:
             self._sock.close()  # type: ignore[union-attr]
         except OSError:

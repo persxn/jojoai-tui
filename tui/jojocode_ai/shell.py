@@ -73,6 +73,11 @@ def _decode(data: bytes, cut_start: bool = False, cut_end: bool = False) -> str:
     which must not send the whole kept output to the legacy code page."""
     if not data:
         return ""
+    wide = _wide_encoding(data)
+    if wide:
+        # wsl.exe and wmic write UTF-16 when redirected: read as UTF-8 it
+        # reached the model NUL-interleaved and drew as blank lines
+        return data.decode(wide, errors="replace").lstrip("\ufeff").replace("\r\n", "\n")
     utf8 = data
     if cut_start:
         i = 0
@@ -92,6 +97,17 @@ def _decode(data: bytes, cut_start: bool = False, cut_end: bool = False) -> str:
         except LookupError:
             text = data.decode("utf-8", errors="replace")
     return text.replace("\r\n", "\n")
+
+
+def _wide_encoding(data: bytes) -> str | None:
+    from .textfiles import sniff
+    head = data[:8192]
+    found = sniff(head)
+    # The NULs too, not a BOM alone: two stray bytes FF FE at the start of
+    # ordinary output are not a reason to read all of it as UTF-16.
+    if found and found[0].startswith(("utf-16", "utf-32")) and b"\x00" in head:
+        return found[0]
+    return None
 
 
 def _read_bounded(f) -> str:
@@ -158,8 +174,21 @@ def as_command(cmd) -> str:
     """Models sometimes send argv lists (["bash", "-lc", "ls"]); join them properly."""
     if isinstance(cmd, (list, tuple)):
         parts = [str(c) for c in cmd]
-        return subprocess.list2cmdline(parts) if IS_WINDOWS else shlex.join(parts)
+        return " ".join(_cmd_quote(p) for p in parts) if IS_WINDOWS else shlex.join(parts)
     return str(cmd)
+
+
+_CMD_SPECIAL = set(' \t&|<>^()%!"')
+
+
+def _cmd_quote(arg: str) -> str:
+    """One argument for cmd.exe. list2cmdline quotes for the C runtime only:
+    in ["echo", "hi&calc"] the & stayed bare and cmd.exe ran calc. Inside
+    double quotes cmd.exe's operators are text; a doubled "" is a quote to
+    both cmd.exe and the C runtime."""
+    if arg and not (set(arg) & _CMD_SPECIAL):
+        return arg
+    return '"' + arg.replace('"', '""') + '"'
 
 
 def precheck(cmd, cwd: str) -> str | None:
@@ -192,6 +221,11 @@ def run(cmd, cwd: str, timeout: float, cancel=None) -> Result:
     env.setdefault("GIT_TERMINAL_PROMPT", "0")   # fail, rather than wait for a password
     env.setdefault("PYTHONIOENCODING", "utf-8")  # a Python child on Windows would write cp1252
     env.setdefault("GCM_INTERACTIVE", "never")    # Git Credential Manager: no pop-up prompts
+    if IS_WINDOWS:
+        # cmd.exe looks in the current directory before PATH: a git.cmd the
+        # model wrote into the project (auto-edit, no prompt) ran when the
+        # user approved "git status".
+        env["NoDefaultCurrentDirectoryInExePath"] = "1"
     # Overridden, not defaulted: with core.editor "code --wait" (or Notepad),
     # `git commit` without -m opened a window and blocked until the timeout.
     # `true` exits at once: the commit aborts for an empty message, and

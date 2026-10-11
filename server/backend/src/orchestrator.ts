@@ -57,7 +57,7 @@ function dispatchTool(
   const cached = s.toolResults.get(tc.id);
   if (cached) return Promise.resolve(cached); // resume replay — already answered
 
-  s.pendingTools.set(tc.id, { name: tc.name, args: tc.args });
+  s.pendingTools.set(tc.id, { name: tc.name, args: tc.args, dispatchedAt: Date.now() });
   return new Promise<ToolResultPayload>((resolve) => {
     const timer = setTimeout(() => {
       s.toolWaiters.delete(tc.id);
@@ -92,8 +92,12 @@ export function replayPending(s: Session, send: Send): void {
   const outstanding = [...s.pendingTools.entries()];
   if (!outstanding.length) return;
   send({ t: 'replay_begin', count: outstanding.length });
-  for (const [id, { name, args }] of outstanding) {
-    send({ t: 'tool_request', id, name, args, timeoutMs: config.toolTimeoutMs, destructive: isDestructive(name) });
+  const now = Date.now();
+  for (const [id, { name, args, dispatchedAt }] of outstanding) {
+    // What is left on the timer started at dispatch — a full window here let
+    // the client run a command the model had already been told did not run.
+    const timeoutMs = Math.max(0, config.toolTimeoutMs - (now - dispatchedAt));
+    send({ t: 'tool_request', id, name, args, timeoutMs, destructive: isDestructive(name) });
   }
   send({ t: 'replay_end' });
 }

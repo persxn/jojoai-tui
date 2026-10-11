@@ -24,7 +24,7 @@ import threading
 import time
 from dataclasses import dataclass
 
-from . import shell, textfiles
+from . import policy, shell, textfiles
 
 MAX_OUTPUT = 20000      # chars returned to the model per tool call
 MAX_ENTRIES = 500       # list_dir entries shown
@@ -76,36 +76,9 @@ def _resolve(ctx: Ctx, path) -> str:
     return os.path.normpath(path)
 
 
-def _canon(p: str) -> str:
-    if IS_WINDOWS:
-        if p.startswith("\\\\?\\UNC\\"):
-            p = "\\\\" + p[8:]
-        elif p.startswith("\\\\?\\"):
-            p = p[4:]                           # \\?\C:\x is C:\x
-    p = os.path.normcase(os.path.realpath(p))
-    if sys.platform == "darwin":
-        p = p.casefold()                        # APFS is case-insensitive; normcase is not
-    return p
-
-
-def _protected() -> list[str]:
-    """JojoAI's own history and credentials: never a tool's business."""
-    from .config import config_dir
-    data = os.environ.get("JOJO_DATA") or os.path.expanduser("~/.local/share/jojocode-ai")
-    return [_canon(data), _canon(config_dir())]
-
-
-def _jojo_data_dir() -> str:
-    return os.path.realpath(
-        os.environ.get("JOJO_DATA") or os.path.expanduser("~/.local/share/jojocode-ai"))
-
-
-def _blocked(path: str) -> bool:
-    try:
-        rp = _canon(path)
-        return any(rp == d or rp.startswith(d.rstrip(os.sep) + os.sep) for d in _protected())
-    except (OSError, ValueError):
-        return False
+# JojoAI's own history and credentials are never a tool's business. The rule
+# lives in policy.py so remote mode applies the very same one.
+_blocked = policy.blocked
 
 
 def _int(value, default: int) -> int:
@@ -481,9 +454,15 @@ def _walk_search(rx, path: str, ctx: Ctx) -> str:
             if not stat.S_ISREG(os.stat(fp).st_mode):       # FIFOs, devices: open() blocks
                 return ""
             with open(fp, "rb") as fb:
-                if b"\x00" in fb.read(2048):                 # looks binary
-                    return ""
-            with open(fp, "r", encoding="utf-8", errors="ignore") as f:
+                found = textfiles.sniff(fb.read(textfiles.SNIFF))
+            if found is None:                                # binary
+                return ""
+            # the file's own encoding, as read_file and ripgrep see it: a
+            # UTF-16 build log (PowerShell's >) was skipped as binary here
+            enc, bom = found
+            codec = {"utf-8": "utf-8-sig", "utf-16-le": "utf-16", "utf-16-be": "utf-16",
+                     "utf-32-le": "utf-32", "utf-32-be": "utf-32"}.get(enc, enc) if bom else enc
+            with open(fp, "r", encoding=codec, errors="ignore") as f:
                 # Bounded pieces, not lines: a one-line 300 MB bundle was read
                 # whole; and the clock and Ctrl-C are checked inside a big file,
                 # not only between files.

@@ -58,7 +58,7 @@ export function createGateway(server: Server): SessionManager {
             }
             session = existing;
             mgr.attach(session, ws);
-            send(ws, { t: 'session_ready', protocol: PROTOCOL_VERSION, sessionId: session.id, seatNo: session.seatNo, resumeToken: session.resumeToken, resumed: true });
+            send(ws, { t: 'session_ready', protocol: PROTOCOL_VERSION, sessionId: session.id, seatNo: session.seatNo, resumeToken: session.resumeToken, resumed: true, turnActive: session.turnActive, model: config.model });
             replayPending(session, (m) => send(ws, m));
             return;
           }
@@ -70,7 +70,7 @@ export function createGateway(server: Server): SessionManager {
           }
           session = created;
           mgr.attach(session, ws);
-          send(ws, { t: 'session_ready', protocol: PROTOCOL_VERSION, sessionId: session.id, seatNo: session.seatNo, resumeToken: session.resumeToken, resumed: false });
+          send(ws, { t: 'session_ready', protocol: PROTOCOL_VERSION, sessionId: session.id, seatNo: session.seatNo, resumeToken: session.resumeToken, resumed: false, turnActive: false, model: config.model });
           })().catch((e: unknown) => {
             send(ws, { t: 'closing', code: CloseCode.UNAUTHENTICATED, reason: `auth error: ${(e as Error).message}`, resumable: false });
             ws.close(CloseCode.UNAUTHENTICATED);
@@ -127,12 +127,14 @@ export function createGateway(server: Server): SessionManager {
       }
     });
 
-    ws.on('close', () => {
-      if (session) mgr.detach(session);
-    });
-    ws.on('error', () => {
-      if (session) mgr.detach(session);
-    });
+    // Only this socket's own session binding: an old socket whose close
+    // arrives minutes late (half-open link, edge timeout) used to detach a
+    // session that had already resumed on a new one, dropping its output.
+    const drop = (): void => {
+      if (session && session.ws === ws) mgr.detach(session);
+    };
+    ws.on('close', drop);
+    ws.on('error', drop);
   });
 
   return mgr;

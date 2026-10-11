@@ -38,9 +38,20 @@ SNIFF = 8192
 
 
 def legacy_encoding() -> str:
-    """What a non-UTF-8 text file on this machine most likely is."""
+    """What a non-UTF-8 text file on this machine most likely is: the ANSI
+    code page. Asked of Windows itself — in Python's UTF-8 mode (PYTHONUTF8=1,
+    the default from 3.15) the locale answers "utf-8", and a Russian or
+    Japanese machine's files were read as cp1252."""
     if os.name == "nt":
-        enc = locale.getpreferredencoding(False) or "cp1252"
+        try:
+            import ctypes
+            acp = ctypes.windll.kernel32.GetACP()
+            if acp and acp != 65001:
+                return f"cp{acp}"
+        except (AttributeError, OSError):
+            pass
+        enc = (locale.getencoding() if hasattr(locale, "getencoding")
+               else locale.getpreferredencoding(False)) or "cp1252"
         return "cp1252" if enc.lower().replace("-", "") in ("utf8", "cp65001") else enc
     return "cp1252"
 

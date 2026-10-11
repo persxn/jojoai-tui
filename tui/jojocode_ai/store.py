@@ -164,6 +164,18 @@ class Store:
         if role in ("user", "assistant") and isinstance(content, str):
             self._q.put((role, content, self.title))
 
+    def close(self, timeout: float = 2.0) -> None:
+        """Stop the index worker and close the database. /reset made a new
+        Store each time and leaked the old one's thread and file handle."""
+        self.flush(timeout)
+        self._q.put(None)
+        self._worker.join(timeout)
+        if not self._worker.is_alive():
+            try:
+                self.db.close()
+            except Exception:  # noqa: BLE001
+                pass
+
     def flush(self, timeout: float = 5.0) -> bool:
         """Wait for queued indexing (tests, and a clean exit). True if drained.
 
@@ -183,7 +195,9 @@ class Store:
     # ---------------------------------------------------------------- #
     def _embed(self, text: str):
         if self.api == "openai":
-            url = self.host + ("" if self.host.endswith("/v1") else "/v1") + "/embeddings"
+            # the same base as chat: /v1 only for a bare server URL (Gemini's
+            # …/v1beta/openai already names its API path)
+            url = _openai_base(self.host) + "/embeddings"
             body = {"model": self.embed_model, "input": text}
         else:
             url, body = self.host + "/api/embeddings", {"model": self.embed_model, "prompt": text}
@@ -211,7 +225,11 @@ class Store:
 
     def _index_loop(self):
         while True:
-            role, content, title = self._q.get()
+            item = self._q.get()
+            if item is None:                  # close()
+                self._q.task_done()
+                return
+            role, content, title = item
             try:
                 self._index(role, content, title)
             except Exception:  # noqa: BLE001 — indexing must never take anything down
@@ -374,3 +392,8 @@ class Store:
         return {"chunks": c[0], "sessions_indexed": c[1],
                 "data_dir": self.dir, "embed_model": self.embed_model,
                 "embed_available": self.embed_available()}
+
+
+def _openai_base(host: str) -> str:
+    from .openai_client import api_base
+    return api_base(host)

@@ -23,19 +23,33 @@ import os
 import re
 import time
 
-from . import shell, textfiles
+from . import policy, shell, textfiles
 
 MAX_READ = 100_000
 MAX_OUT = 20_000
 MAX_ENTRIES = 500
 
 
+def _clean_path(path) -> str:
+    """The path a model meant: quotes and padding dropped, `~` expanded (and
+    then refused by the jail, rather than creating a directory named `~`)."""
+    if not isinstance(path, str) or not path.strip():
+        return "."
+    path = path.strip()
+    if len(path) > 1 and path[0] == path[-1] and path[0] in "\"'":
+        path = path[1:-1]
+    return os.path.expanduser(path) if path.startswith("~") else path
+
+
 def _jail(root: str, path) -> str | None:
-    """Resolve `path` under `root`; None if it escapes."""
-    if not isinstance(path, str):
-        path = "."
-    root = os.path.realpath(root)
-    full = os.path.realpath(os.path.join(root, path or "."))
+    """Resolve `path` under `root`; None if it escapes, or is not a path at
+    all (a NUL raised out of the caller and the server never got a result)."""
+    path = _clean_path(path)
+    try:
+        root = os.path.realpath(root)
+        full = os.path.realpath(os.path.join(root, path))
+    except (ValueError, OSError):
+        return None
     # normcase: on Windows C:\Proj and c:\proj are the same root
     r, f = os.path.normcase(root), os.path.normcase(full)
     # a drive or filesystem root already ends in the separator ("C:\", "/")
@@ -135,6 +149,9 @@ def _dispatch(name: str, args: dict, root: str, cancel=None) -> dict:
         full = _jail(root, args.get("path", "."))
         if full is None:
             return {"ok": False, "refused": "policy", "error": "path escapes project root"}
+        if policy.blocked(full):
+            return {"ok": False, "refused": "policy",
+                    "error": "JojoAI's own data is not accessible to tools"}
         if not os.path.isdir(full):
             return {"ok": False, "error": f"not a directory: {args.get('path', '.')}"}
         entries = sorted(os.scandir(full), key=lambda e: e.name)
@@ -156,6 +173,9 @@ def _dispatch(name: str, args: dict, root: str, cancel=None) -> dict:
         full = _jail(root, args.get("path", ""))
         if full is None:
             return {"ok": False, "refused": "policy", "error": "path escapes project root"}
+        if policy.blocked(full):
+            return {"ok": False, "refused": "policy",
+                    "error": "JojoAI's own data is not accessible to tools"}
         if not os.path.isfile(full):
             return {"ok": False, "error": f"no such file: {args.get('path')}"}
         cap = int(min(max(_num(args.get("max_bytes"), MAX_READ), 1), MAX_READ))
@@ -173,6 +193,9 @@ def _dispatch(name: str, args: dict, root: str, cancel=None) -> dict:
         full = _jail(root, args.get("path", ""))
         if full is None:
             return {"ok": False, "refused": "policy", "error": "path escapes project root"}
+        if policy.blocked(full):
+            return {"ok": False, "refused": "policy",
+                    "error": "JojoAI's own data is not accessible to tools"}
         content = args.get("content")
         if content is None:
             return {"ok": False, "error": "content is required (an empty string for an empty file)"}
@@ -182,6 +205,8 @@ def _dispatch(name: str, args: dict, root: str, cancel=None) -> dict:
             return {"ok": False, "error": f"{args.get('path')} is a directory"}
         # an existing file keeps its encoding, BOM and line endings
         tf = (textfiles.read(full) if os.path.isfile(full) else None) or textfiles.new_file()
+        if "\r\n" in content:
+            tf.newline = "\r\n"        # written on purpose (a .bat), as in local mode
         try:
             data = tf.encode_text(content)
         except ValueError as e:
