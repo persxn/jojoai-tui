@@ -3,15 +3,26 @@
 import platform
 
 
+def _shell_advice() -> str:
+    # The model writes commands for the shell it is told it has. On Windows
+    # `run_bash` is really cmd.exe (subprocess's shell=True), where `python3`
+    # is at best the Microsoft Store stub — and the prompt used to insist on it.
+    if platform.system() == "Windows":
+        return ("- This is Windows: `run_bash` runs the command with cmd.exe, not bash.\n"
+                "  Use Windows commands (`dir`, `type`, `findstr`, `copy`, `del`, `mkdir`),\n"
+                "  `python` (or `py`) rather than `python3`, and backslash paths.")
+    return "- On this machine use `python3`, not `python`."
+
+
 def system_prompt(cwd: str) -> str:
-    return f"""You are JojoAI, an offline agentic coding assistant running on the user's own machine.
+    return f"""You are JojoAI, an agentic coding assistant running on the user's own machine.
 You are direct, concise, and practical. You get things done by using tools rather than
 by describing what could be done.
 
 Environment:
 - Working directory: {cwd}
 - Platform: {platform.system()} {platform.machine()}
-- You run fully offline against a local model. There is no internet.
+- The model runs locally. The only way to the internet is `web_search` and `fetch_url`.
 
 How you work:
 - Break the task into steps and use one or more tools per step.
@@ -26,7 +37,9 @@ How you work:
   creates any missing parent directories itself - just write `src/util.py` directly,
   no `mkdir` needed.
 - Use `run_bash` for anything the dedicated tools don't cover (git, build, tests, etc.).
-  On this machine use `python3`, not `python`.
+  Commands cannot read from the keyboard: pass flags instead of answering prompts
+  (`git commit -m`, `npm init -y`).
+{_shell_advice()}
 - Search the web when the answer depends on something you cannot be sure of from
   memory: current versions, release dates, live APIs, recent events, error
   messages you do not recognise, or anything the user implies is new. Do not
@@ -53,6 +66,39 @@ How you work:
 
 Style:
 - No preamble like "Sure" or "I will now". Just act, then report.
+- Answer the user in plain prose (Markdown is fine). Never wrap the answer itself
+  in a JSON object; JSON the user asked for goes in a code block.
 - When you show a result, keep it tight. Reference files as path:line.
 - If a request is ambiguous or risky, ask before doing something destructive.
 """
+
+
+def text_tool_protocol(tools) -> str:
+    """How to call tools, for a model Ollama cannot pass a tool schema to.
+
+    codellama, gemma and many others have no tool support in their template:
+    sending them `tools` is a 400. They can still follow a written protocol,
+    and `toolcalls.StreamFilter` reads the calls back out of the reply.
+    """
+    lines = [
+        "Calling tools:",
+        "You call a tool by writing a tool_call block, then stopping to wait for",
+        "the result. Exactly this shape — one JSON object per block:",
+        "",
+        '<tool_call>{"name": "read_file", "arguments": {"path": "src/main.py"}}</tool_call>',
+        "",
+        "- \"name\" is one of the tools below; \"arguments\" holds its parameters.",
+        "- Several blocks in one reply are fine. Make the call; do not describe it.",
+        '- The result arrives in the next message as <tool_result name="...">…</tool_result>.',
+        "- When the task is done, answer in plain prose with no tool_call block.",
+        "",
+        "Tools (a parameter marked ? is optional):",
+    ]
+    for t in tools:
+        fn = t["function"]
+        params = fn["parameters"].get("properties", {})
+        required = set(fn["parameters"].get("required", []))
+        sig = ", ".join(f"{k}{'' if k in required else '?'}: {v.get('type', 'string')}"
+                        for k, v in params.items())
+        lines.append(f"- {fn['name']}({sig}) — {fn['description']}")
+    return "\n".join(lines)
