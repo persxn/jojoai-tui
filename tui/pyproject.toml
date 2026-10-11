@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "jojocode-ai-tui"
-version = "0.2.1"
+version = "0.3.0"
 description = "A curses agentic coding assistant for the terminal — runs against your own Ollama, or a remote server."
 readme = "README.md"
 requires-python = ">=3.9"

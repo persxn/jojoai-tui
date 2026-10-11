@@ -17,8 +17,11 @@ credentials, and everything reads it. Highest wins:
     settings.json "model"    what the installer chose for this machine
     FALLBACK_MODEL           a machine nobody has measured
 
-The same file holds `host`, so a box running Ollama elsewhere is configured
-once rather than aliased into every shell.
+The same file holds `host` (and `api`), so a box running Ollama elsewhere is
+configured once rather than aliased into every shell. Host precedence is
+--host, JOJO_HOST, settings.json, then OLLAMA_HOST — the variable the user's
+own Ollama already reads, which used to be ignored here — and a host is
+accepted the way Ollama accepts it: `localhost:11434`, `0.0.0.0`, `:11434`.
 """
 
 from __future__ import annotations
@@ -39,9 +42,12 @@ def settings_path() -> str:
 
 def load_settings() -> dict:
     """Never raises: a missing or corrupt settings file must not stop the TUI
-    from starting, because its whole job is to make starting easier."""
+    from starting, because its whole job is to make starting easier.
+
+    utf-8-sig: Notepad and PowerShell 5.1 save with a BOM, which plain utf-8
+    rejected — and the whole file was then silently ignored."""
     try:
-        with open(settings_path(), encoding="utf-8") as f:
+        with open(settings_path(), encoding="utf-8-sig") as f:
             data = json.load(f)
         return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
@@ -57,6 +63,13 @@ def save_settings(**values) -> str:
     path = settings_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
     data = load_settings()
+    if not data and os.path.exists(path):
+        # Unreadable, not empty: keep it rather than overwrite a hand edit
+        # (with a typo in it) that held more than this one key.
+        try:
+            os.replace(path, path + ".bak")
+        except OSError:
+            pass
     for k, v in values.items():
         if v is None:
             data.pop(k, None)
@@ -75,20 +88,58 @@ def save_settings(**values) -> str:
 # install is usually the hosted DGX, where it is the right answer.
 FALLBACK_MODEL = "gpt-oss:120b"
 
+def normalize_host(host: str) -> str:
+    """A URL for whatever the user wrote, read the way Ollama reads OLLAMA_HOST.
+
+    No scheme means http and port 11434; 0.0.0.0 / :: (an address to listen
+    on, not to connect to — Windows refuses the connection) means loopback.
+    """
+    h = (host or "").strip().rstrip("/")
+    if not h:
+        return "http://127.0.0.1:11434"
+    scheme, sep, rest = h.partition("://")
+    if not sep:
+        scheme, rest = "http", h
+        hostport, slash, path = rest.partition("/")
+        if hostport.startswith(":") and hostport[1:].isdigit():
+            hostport = "127.0.0.1" + hostport                # ":11434"
+        if hostport.count(":") > 1 and not hostport.startswith("["):
+            hostport = f"[{hostport}]"                       # a bare IPv6 address
+        has_port = hostport.rsplit(":", 1)[-1].isdigit() and not hostport.endswith("]")
+        if not has_port:
+            hostport += ":11434"
+        rest = hostport + (slash + path if slash else "")
+    for any_addr in ("0.0.0.0", "[::]"):
+        if rest == any_addr or rest.startswith(any_addr + ":") or rest.startswith(any_addr + "/"):
+            rest = "127.0.0.1" + rest[len(any_addr):]
+    return f"{scheme.lower()}://{rest}"
+
+
+def _default_mouse() -> bool:
+    # Mouse reporting in a classic Windows console (conhost) turns QuickEdit
+    # off: right-click paste and drag-to-select stop working, and "hold Shift"
+    # does not bring them back there. Windows Terminal sets WT_SESSION.
+    return not (os.name == "nt" and not os.environ.get("WT_SESSION"))
+
+
 _settings = load_settings()
 
-DEFAULT_HOST = (os.environ.get("JOJO_HOST")
-                or _settings.get("host")
-                or "http://127.0.0.1:11434")
+DEFAULT_HOST = normalize_host(os.environ.get("JOJO_HOST")
+                              or _settings.get("host")
+                              or os.environ.get("OLLAMA_HOST")
+                              or "http://127.0.0.1:11434")
 DEFAULT_MODEL = (os.environ.get("JOJO_MODEL")
                  or _settings.get("model")
                  or FALLBACK_MODEL)
+# "ollama", "openai" (any OpenAI-compatible server) or "auto" (by the host URL)
+DEFAULT_API = os.environ.get("JOJO_API") or _settings.get("api") or "auto"
 
 
 @dataclass
 class Config:
     host: str = DEFAULT_HOST
     model: str = DEFAULT_MODEL
+    api: str = DEFAULT_API
     cwd: str = field(default_factory=os.getcwd)
     # gpt-oss reasoning: True/False, or "low" / "medium" / "high"
     think: object = "medium"
@@ -110,7 +161,7 @@ class Config:
 
     # capture the mouse wheel to scroll the transcript (--no-mouse / `/mouse` to disable;
     # hold Shift, or Option on macOS, to select text while it's on)
-    mouse: bool = True
+    mouse: bool = field(default_factory=_default_mouse)
 
     # remote mode: when set, the agent loop runs on this server and `host`/`model`
     # above are ignored (the server owns them). Token comes from `jojo --login`.

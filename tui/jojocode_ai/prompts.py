@@ -1,4 +1,11 @@
-"""System prompt for JojoAI."""
+"""System prompt for JojoAI.
+
+The prompt is rebuilt before every request (agent._wire), so what it tells the
+model — the working directory, and who approves what — is what is true now:
+after change_dir or /cwd, and after --safe, --trust, /trust or YOLO. It used to
+say "every run_bash still requires the user's confirmation" even when nothing
+did, so the model leaned on a safety net that was not there.
+"""
 
 import platform
 
@@ -11,10 +18,41 @@ def _shell_advice() -> str:
         return ("- This is Windows: `run_bash` runs the command with cmd.exe, not bash.\n"
                 "  Use Windows commands (`dir`, `type`, `findstr`, `copy`, `del`, `mkdir`),\n"
                 "  `python` (or `py`) rather than `python3`, and backslash paths.")
-    return "- On this machine use `python3`, not `python`."
+    return ("- On this machine use `python3`, not `python`. A command ending in `&` keeps\n"
+            "  running in the background after the call returns (use that for servers).")
 
 
-def system_prompt(cwd: str) -> str:
+def _approvals(cfg) -> str:
+    if cfg is None:
+        return ("- You may create and edit files inside the project without asking;\n"
+                "  edits elsewhere, and every `run_bash`, need the user's confirmation.")
+    if "*" in getattr(cfg, "auto_approve", ()):
+        return ("- Nothing you do is reviewed: every tool, `run_bash` included, runs\n"
+                "  without asking (YOLO). Be conservative; ask in prose before anything\n"
+                "  destructive or irreversible.")
+    # "always allow" at the prompt counts too: telling the model the user
+    # confirms every command after they stopped being asked removed a safety
+    # net the model was leaning on.
+    always = getattr(cfg, "auto_approve", ()) or ()
+    if "write_file" in always and "edit_file" in always:
+        edits = "files you create or edit are written WITHOUT confirmation, anywhere"
+    elif getattr(cfg, "auto_edit", True) or "write_file" in always or "edit_file" in always:
+        edits = ("you may create and edit files inside the project without asking (not\n"
+                 "  dot-files or anything under .git); everywhere else the user confirms")
+    else:
+        edits = "the user confirms every file you create or edit"
+    if "write_file" in always and "edit_file" not in always:
+        edits += " (new and overwritten files are not confirmed at all)"
+    elif "edit_file" in always and "write_file" not in always:
+        edits += " (edits to existing files are not confirmed at all)"
+    cmds = ("`run_bash` commands run WITHOUT confirmation — be careful, and ask in\n"
+            "  prose before anything destructive"
+            if getattr(cfg, "auto_bash", False) or "run_bash" in always else
+            "the user confirms every `run_bash` command")
+    return f"- Approvals: {edits}; {cmds}."
+
+
+def system_prompt(cwd: str, cfg=None) -> str:
     return f"""You are JojoAI, an agentic coding assistant running on the user's own machine.
 You are direct, concise, and practical. You get things done by using tools rather than
 by describing what could be done.
@@ -29,9 +67,7 @@ How you work:
 - You may work across the whole filesystem. Use `change_dir` to move into another
   project or folder; after that, relative paths resolve there. `list_dir`,
   `read_file`, `search` and `run_bash` also accept absolute paths directly.
-- You are allowed to create and edit files without asking. `write_file` and
-  `edit_file` inside the current working directory are pre-approved; edits
-  outside it, and every `run_bash`, still require the user's confirmation.
+{_approvals(cfg)}
 - Prefer reading files before editing them. Use `edit_file` for small, surgical changes
   and `write_file` only when creating a file or replacing it wholesale. `write_file`
   creates any missing parent directories itself - just write `src/util.py` directly,

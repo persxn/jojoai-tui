@@ -130,7 +130,7 @@ export async function runTurn(s: Session, text: string, send: Send): Promise<voi
         send({
           t: 'turn_done',
           usage: { tokensIn: totalIn, tokensOut: totalOut, modelMs: totalModelMs, toolCalls: toolCallCount },
-          stopReason: result.stoppedBy === 'length' ? 'max_wallclock' : 'model_done',
+          stopReason: result.stoppedBy === 'length' ? 'max_tokens' : 'model_done',
         });
         return;
       }

@@ -113,7 +113,15 @@ def inline_segments(text: str, A: dict) -> list[tuple[str, int]]:
     return out or [(text, A["assist"])]
 
 
-_FENCE = re.compile(r"^\s*```([\w+-]*)\s*$")
+# An opening fence: three or more backticks (or tildes), then an info string
+# whose first word is the language — "```c#", "```python:src/app.py" and
+# "``` python" all used to fail the old bare-word pattern and swap prose and
+# code for the rest of the reply.
+_OPEN = re.compile(r"^\s*(`{3,}|~{3,})[ \t]*([^`\s]*)[^`]*$")
+
+
+def _lang(info: str) -> str:
+    return re.split(r"[:{,]", info, maxsplit=1)[0]
 
 
 def split_fences(body: str):
@@ -122,20 +130,22 @@ def split_fences(body: str):
     i = 0
     buf: list[str] = []
     while i < len(lines):
-        m = _FENCE.match(lines[i])
+        m = _OPEN.match(lines[i])
         if m:
             if buf:
                 yield ("text", "\n".join(buf)); buf = []
-            lang = m.group(1)
+            fence, lang = m.group(1), _lang(m.group(2))
+            # closes on the same character, at least as many, and nothing else
+            close = re.compile(r"^\s*" + re.escape(fence[0]) + "{" + str(len(fence)) + r",}\s*$")
             code: list[str] = []
             i += 1
-            while i < len(lines) and not _FENCE.match(lines[i]):
+            while i < len(lines) and not close.match(lines[i]):
                 code.append(lines[i]); i += 1
             i += 1  # skip closing fence
             if any(l.strip() for l in code):
                 yield ("code", lang, code)
             elif lang:
-                yield ("text", "```" + lang + "```")
+                yield ("text", fence + lang + fence)
         else:
             buf.append(lines[i]); i += 1
     if buf:

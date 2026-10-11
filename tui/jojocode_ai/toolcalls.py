@@ -17,6 +17,10 @@ does not behave that well:
 - Models with no tool support at all (codellama, gemma, …) are taught the tools
   in the system prompt instead (prompts.text_tool_protocol) and answer in one
   of the shapes above.
+- Reasoning models whose template cannot separate thinking (old deepseek-r1
+  pulls, many hf.co GGUFs) write it inline as <think>…</think>. That text is
+  reasoning, not an answer: it goes out on the thinking channel, and a call
+  the model merely *considered* inside it is never run.
 
 `StreamFilter` sits between the stream and the screen. Prose is shown as it
 arrives; anything that could be the start of a call is held back until it can
@@ -25,10 +29,11 @@ native calls produce. Whatever turns out not to be a call is released
 unchanged, so a JSON answer the user actually asked for still reaches them.
 
 What counts as a call is deliberately narrow: an object that names a tool and
-carries its arguments. Inside a code fence the name must also be one of our
-tools, because a fenced example in an explanation is far likelier there. The
-approval gate still stands in front of every write and command, whichever way
-the call arrived.
+carries its arguments and nothing else — a tool *definition* with a
+description, or a log line with a timestamp, is not one. Inside a code fence
+the name must also be one of our tools, because a fenced example in an
+explanation is far likelier there. The approval gate still stands in front of
+every write and command, whichever way the call arrived.
 """
 
 from __future__ import annotations
@@ -36,19 +41,24 @@ from __future__ import annotations
 import ast
 import json
 import re
+import warnings
 
 _NAME_KEYS = ("name", "tool", "tool_name", "function", "action")
 _ARG_KEYS = ("arguments", "parameters", "args", "input", "params",
              "action_input", "tool_input")
 _WRAPPER_KEYS = ("tool_calls", "function_calls", "calls")
 # Keys a call object may carry besides its name and arguments.
-_META_KEYS = {"id", "type", "index"}
+_META_KEYS = {"id", "type", "index", "call_id"}
 # A whole reply that is nothing but {"response": "..."} is an answer in a JSON
 # costume. Only names that are rarely a real payload on their own.
 _REPLY_KEYS = ("response", "answer", "final_answer", "reply")
 
 # Markers that start a call wherever they appear.
 _TAGS = ("<tool_call>", "<|python_tag|>", "[TOOL_CALLS]", "<function=")
+_THINK = ("<think>", "<thinking>")
+_BARE_CLOSE = ("</think>", "</thinking>")
+_RESULT = "<tool_result"
+_MARKERS = _TAGS + _THINK + _BARE_CLOSE + (_RESULT,)
 # Fence languages a call is written under. Anything else is ordinary code.
 _CALL_LANGS = {"", "json", "json5", "jsonc", "tool_call", "tool_code", "tool",
                "tools", "function", "function_call", "functions"}
@@ -56,6 +66,11 @@ _CLOSE_FENCE = re.compile(r"^[ \t]*```[ \t]*$", re.M)
 _MISSING = object()
 # ast.literal_eval on model output is safe but not free; a call is never this big.
 _LITERAL_LIMIT = 200_000
+# A JSON string literal whose raw text starts like a Windows path with single
+# backslashes: "C:\Users\me" — invalid JSON (\U), or silently wrong ("\t").
+_STRING = re.compile(r'"((?:[^"\\]|\\.)*)"', re.S)
+_RAW_WINPATH_DECODED = re.compile(r"^[A-Za-z]:")
+_BAD_ESCAPE = re.compile(r'\\(?!["\\/bfnrtu])')
 
 
 def tool_info(tools) -> dict:
@@ -73,21 +88,104 @@ def tool_info(tools) -> dict:
 # recognising a call in a finished piece of text
 # --------------------------------------------------------------------------- #
 
+def _repair_backslashes(text: str) -> str:
+    r"""Double the lone backslashes of string literals that hold escapes JSON
+    does not have (C:\Users is not JSON). Only those: a string that already
+    decodes is left alone — "x:\n  y: 1" is YAML, not a path, and doubling its
+    backslashes wrote a literal backslash-n into the file. A path whose
+    backslashes happen to be valid escapes (C:\temp\new) is fixed after
+    parsing, by _fix_paths, where the key says it is a path."""
+    def fix(m):
+        body = m.group(1)
+        if _BAD_ESCAPE.search(body):
+            body = re.sub(r'\\(?![\\"])', r"\\\\", body)
+        return f'"{body}"'
+    return _STRING.sub(fix, text)
+
+
+_PATH_KEYS = frozenset({"path", "cwd", "file", "file_path", "filename", "dir", "directory"})
+_CTRL_ESCAPE = {"\n": "\\n", "\t": "\\t", "\r": "\\r", "\b": "\\b", "\f": "\\f"}
+
+
+def _fix_paths(args: dict) -> dict:
+    r""""C:\temp\new.txt" written raw is valid JSON that decodes to a tab and a
+    newline. No path holds a control character, so in a path argument that
+    starts like a Windows path they are put back as the backslashes they were."""
+    out = None
+    for k, v in args.items():
+        if k in _PATH_KEYS and isinstance(v, str) and (_RAW_WINPATH_DECODED.match(v)
+                                                       or v.startswith("\\")) \
+                and any(c in v for c in _CTRL_ESCAPE):
+            out = out if out is not None else dict(args)
+            out[k] = "".join(_CTRL_ESCAPE.get(c, c) for c in v)
+    return args if out is None else out
+
+
+def _json_safe(obj):
+    """literal_eval can return bytes, sets, complex — none of which survive the
+    next request's json.dumps. Such a value is not a call we can keep."""
+    try:
+        return json.loads(json.dumps(obj))
+    except (TypeError, ValueError):
+        return _MISSING
+
+
 def _load(text: str):
     text = text.strip()
     if not text:
         return _MISSING
     try:
-        return json.loads(text)
+        return json.loads(text)          # valid JSON means what it says
     except ValueError:
         pass
-    if len(text) <= _LITERAL_LIMIT:
-        try:
-            # {'name': 'read_file', ...} — a Python-dict habit some models have
-            return ast.literal_eval(text)
-        except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
-            pass
+    if "\\" in text:
+        fixed = _repair_backslashes(text)
+        if fixed != text:
+            try:
+                return json.loads(fixed)
+            except ValueError:
+                pass
+    if len(text) <= _LITERAL_LIMIT and text[:1] in "{[":
+        with warnings.catch_warnings():
+            # Python 3.12 warns on invalid escapes; on Windows that warning was
+            # printed straight over the curses screen.
+            warnings.simplefilter("ignore")
+            try:
+                # {'name': 'read_file', ...} — a Python-dict habit some models have
+                return _json_safe(ast.literal_eval(text))
+            except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+                pass
     return _MISSING
+
+
+def _values(text: str):
+    """Two or more JSON values back to back (pretty-printed calls in one fence)."""
+    for candidate in (text, _repair_backslashes(text) if "\\" in text else None):
+        if candidate is None:
+            break
+        out = _split_values(candidate)
+        if out is not None:
+            return out
+    return None
+
+
+def _split_values(text: str):
+    dec, i, out = json.JSONDecoder(), 0, []
+    while True:
+        while i < len(text) and text[i] in " \t\r\n,":
+            i += 1
+        if i >= len(text):
+            break
+        try:
+            value, i = dec.raw_decode(text, i)
+        except ValueError:
+            return None
+        out.append(value)
+    return out if len(out) > 1 else None
+
+
+def _looks_like_schema(args: dict) -> bool:
+    return args.get("type") == "object" and isinstance(args.get("properties"), dict)
 
 
 def _one(obj, info: dict, strict: bool):
@@ -103,11 +201,13 @@ def _one(obj, info: dict, strict: bool):
         return None
     fn = obj.get("function")
     if isinstance(fn, dict) and "name" in fn:        # {"type": "function", "function": {...}}
+        if set(obj) - {"function"} - _META_KEYS:
+            return None
         obj = fn
-    name = next((obj[k] for k in _NAME_KEYS if isinstance(obj.get(k), str)), None)
-    if not name or not name.strip():
+    name_key = next((k for k in _NAME_KEYS if isinstance(obj.get(k), str)), None)
+    if name_key is None or not obj[name_key].strip():
         return None
-    name = name.strip()
+    name = obj[name_key].strip()
     if name.startswith("functions."):
         name = name[len("functions."):]
     known = name in info
@@ -116,14 +216,18 @@ def _one(obj, info: dict, strict: bool):
 
     present = [k for k in _ARG_KEYS if k in obj]
     if present:
-        args = obj[present[0]]
-        canonical = ("name" in obj and present[0] in ("arguments", "parameters")
-                     and set(obj) <= {"name", present[0]} | _META_KEYS)
+        args_key = present[0]
+        # Exactly a name and its arguments: a tool *definition* carries a
+        # description, a log line a timestamp — neither is a call.
+        if set(obj) - {name_key, args_key} - _META_KEYS:
+            return None
+        args = obj[args_key]
+        canonical = name_key == "name" and args_key in ("arguments", "parameters")
     else:
         # {"name": "read_file", "path": "x"} — arguments spilled into the top
         # level. Only believable when every other key is one of that tool's
         # parameters.
-        rest = {k: v for k, v in obj.items() if k not in _NAME_KEYS and k not in _META_KEYS}
+        rest = {k: v for k, v in obj.items() if k != name_key and k not in _META_KEYS}
         if not known or not set(rest) <= info[name][0]:
             return None
         args, canonical = rest, False
@@ -140,9 +244,9 @@ def _one(obj, info: dict, strict: bool):
             return None
     if args is None:
         args = {}
-    if not isinstance(args, dict):
+    if not isinstance(args, dict) or _looks_like_schema(args):
         return None
-    return {"name": name, "arguments": args}
+    return {"name": name, "arguments": _fix_paths(args)}
 
 
 def _from_value(obj, info: dict, strict: bool):
@@ -150,7 +254,7 @@ def _from_value(obj, info: dict, strict: bool):
         for k in _WRAPPER_KEYS:
             if isinstance(obj.get(k), list) and set(obj) <= {k} | _META_KEYS:
                 return _from_value(obj[k], info, strict)
-        if isinstance(obj.get("function_call"), dict):
+        if isinstance(obj.get("function_call"), dict) and len(obj) == 1:
             obj = obj["function_call"]
         call = _one(obj, info, strict)
         return [call] if call else None
@@ -158,6 +262,11 @@ def _from_value(obj, info: dict, strict: bool):
         calls = [_one(o, info, strict) for o in obj]
         return calls if all(calls) else None
     return None
+
+
+def _trim_one_newline(v: str) -> str:
+    v = v[1:] if v.startswith("\n") else v
+    return v[:-1] if v.endswith("\n") else v
 
 
 def _xml_calls(text: str):
@@ -168,7 +277,9 @@ def _xml_calls(text: str):
     for m in re.finditer(r"<function=([\w.\-]+)>(.*?)(?:</function>|\Z)", text, re.S):
         name, inner = m.group(1), m.group(2)
         if "<parameter=" in inner:
-            args = {k: v.strip("\n") for k, v in re.findall(
+            # one newline each side, as the template writes them (Ollama's
+            # qwen3coder parser does the same); strip("\n") ate a file's last newline
+            args = {k: _trim_one_newline(v) for k, v in re.findall(
                 r"<parameter=([\w.\-]+)>(.*?)(?:</parameter>|(?=<parameter=)|\Z)", inner, re.S)}
         else:
             parsed = _load(inner)
@@ -200,7 +311,16 @@ def calls_in(text: str, info: dict, strict: bool = False):
         return calls if calls and all(calls) else None
     if "<function=" in text or "<arg_key>" in text:
         return _xml_calls(text)
-    # one JSON object per line
+    values = _values(text)
+    if values is not None:
+        calls = []
+        for v in values:
+            got = _from_value(v, info, strict)
+            if not got:
+                return None
+            calls += got
+        return calls
+    # one Python-literal object per line
     lines = [ln for ln in text.splitlines() if ln.strip()]
     if len(lines) > 1:
         calls = []
@@ -231,62 +351,96 @@ class StreamFilter:
     """Feed content deltas in, get back the text that is safe to show now.
 
         f = StreamFilter(TOOLS)
-        for delta in stream: show(f.feed(delta))
+        for delta in stream:
+            show(f.feed(delta)); think(f.take_thinking())
         show(f.finish());  f.calls  # -> [{"name", "arguments"}, ...]
+
+    `answer` is the reply minus inline reasoning (what belongs in history).
     """
 
     def __init__(self, tools):
         self.info = tool_info(tools)
         self.calls: list[dict] = []
         self.shown = ""                 # everything released so far
+        self.answer_from = 0            # shown[answer_from:] is the answer proper
+        self._thinking: list[str] = []
         self._buf = ""
         self._pos = 0                   # _buf[:_pos] is decided
         self._line_start = True         # is _buf[_pos] at the start of a line?
         self._hold: dict | None = None  # what is being held back, if anything
         self._in_code = False           # inside a fence we let through
         self._after_call = False        # just dropped a call; its newline is next
+        self._stopped = False           # past an invented <tool_result>: drop the rest
+        self._tags_are_text = False     # a <think> was shown as text: tags are being discussed
+
+    @property
+    def answer(self) -> str:
+        return self.shown[self.answer_from:]
 
     def feed(self, text: str) -> str:
-        self._buf += text
+        # Through a local, so CPython can grow the string in place; `+=` on
+        # an attribute copies the whole buffer on every delta.
+        buf, self._buf = self._buf, ""
+        buf += text
+        self._buf = buf
         return self._advance(final=False)
 
-    def finish(self) -> str:
+    def finish(self, cut: bool = False) -> str:
+        """The rest of the reply. `cut`: it was stopped by the length limit, so
+        a call still being held is half a JSON object — dropped, not shown."""
+        if cut and self._hold is not None:
+            self._buf = self._buf[:self._hold["start"]]
+            self._hold = None
         return self._advance(final=True)
+
+    def take_thinking(self) -> str:
+        """Inline reasoning found since the last call."""
+        text, self._thinking = "".join(self._thinking), []
+        return text
 
     # -- driver ----------------------------------------------------------- #
     def _advance(self, final: bool) -> str:
-        out = []
-        while self._pos < len(self._buf):
+        before = len(self.shown)
+        last, stalled = self._pos, 0
+        while self._pos < len(self._buf) and not self._stopped:
             if self._after_call and not self._eat_newline(final):
                 break
             if self._pos >= len(self._buf):
                 break
             if self._hold is not None:
-                got = self._resolve(final)
-                if got is None:
+                if not self._resolve(final):
                     break
-                out.append(got)
             elif self._in_code:
-                got = self._code_line(final)
-                if got is None:
+                if not self._code_line(final):
                     break
-                out.append(got)
-            else:
-                text, waiting = self._text(final)
-                out.append(text)
-                if waiting:
-                    break
-        text = "".join(out)
-        self.shown += text
-        return text
+            elif self._text(final):
+                break
+            stalled = stalled + 1 if self._pos == last else 0
+            last = self._pos
+            if stalled > 16:
+                # Steps that keep going round without consuming anything would
+                # repeat forever, freezing the turn where Ctrl-C cannot reach.
+                # Never expected; if a rule regresses, show the text and move on.
+                self._hold = None
+                self._take(self._pos + 1)
+                stalled = 0
+        if self._stopped:
+            self._pos = len(self._buf)
+        if self._hold is None and self._pos > 8192:
+            # Every hold stores absolute offsets, so only trim between holds.
+            # Without this the buffer grew for the whole reply and every
+            # delta copied all of it.
+            self._buf = self._buf[self._pos:]
+            self._pos = 0
+        return self.shown[before:]
 
-    def _take(self, end: int) -> str:
+    def _take(self, end: int) -> None:
         """Release _buf[_pos:end] as visible text."""
         text = self._buf[self._pos:end]
         if text:
             self._line_start = text.endswith("\n")
+            self.shown += text
         self._pos = end
-        return text
 
     def _consume(self, end: int):
         """Drop _buf[_pos:end] (it was a call). The rest of its line goes too
@@ -311,18 +465,18 @@ class StreamFilter:
         return True
 
     # -- ordinary text ---------------------------------------------------- #
-    def _text(self, final: bool):
-        """Release text up to the next possible call. Returns (text, waiting)."""
+    def _text(self, final: bool) -> bool:
+        """Release text up to the next possible call. Returns True to wait."""
         buf, pos = self._buf, self._pos
         cut, hold = len(buf), None
 
-        for tag in _TAGS:
-            i = buf.find(tag, pos)
+        for tag in _MARKERS:
+            i = buf.find(tag, pos, cut + len(tag))
             if 0 <= i < cut:
                 cut, hold = i, {"kind": "tag", "tag": tag, "start": i}
 
         # a call written on its own line
-        i = pos if self._line_start else buf.find("\n", pos) + 1 or -1
+        i = pos if self._line_start else buf.find("\n", pos, cut) + 1 or -1
         while 0 <= i < cut:
             j = i
             while j < len(buf) and buf[j] in " \t":
@@ -333,57 +487,90 @@ class StreamFilter:
                 if not final:          # can't tell yet what this line is
                     cut, hold = i, None
                 break
-            if any(buf.startswith(t, j) for t in _TAGS):
-                pass                   # the tag search above has it
+            if any(buf.startswith(t, j) for t in _MARKERS):
+                pass                   # the marker search above has it
             elif buf[j] in "{[":
                 cut, hold = i, {"kind": "json", "start": i, "open": j}
                 break
             elif buf.startswith("```", j):
                 cut, hold = i, {"kind": "fence", "start": i, "open": j}
                 break
-            nl = buf.find("\n", j)
+            nl = buf.find("\n", j, cut)
             i = nl + 1 if nl >= 0 else -1
 
-        # a tag that may be arriving in pieces: "...<tool_c"
+        # a marker that may be arriving in pieces: "...<tool_c"
         if not final and hold is None and cut == len(buf):
-            base = max(pos, cut - 14)
+            base = max(pos, cut - 16)
             tail = buf[base:cut]
-            for tag in _TAGS:
+            for tag in _MARKERS:
                 for k in range(min(len(tag) - 1, len(tail)), 0, -1):
                     if tail.endswith(tag[:k]):
                         cut = min(cut, base + len(tail) - k)
                         break
 
-        text = self._take(cut)
+        self._take(cut)
         if hold is not None:
             self._hold = hold
-            return text, False
-        return text, self._pos < len(buf)
+            return False
+        return self._pos < len(buf)
 
-    def _code_line(self, final: bool):
+    def _code_line(self, final: bool) -> bool:
         """Inside a fence that is plainly code: pass it through line by line."""
         nl = self._buf.find("\n", self._pos)
         if nl < 0:
-            return self._take(len(self._buf)) if final else None
-        line = self._buf[self._pos:nl]
-        if _CLOSE_FENCE.fullmatch(line):
+            if final:
+                self._take(len(self._buf))
+                return True
+            return False
+        if _CLOSE_FENCE.fullmatch(self._buf[self._pos:nl]):
             self._in_code = False
-        return self._take(nl + 1)
+        self._take(nl + 1)
+        return True
 
     # -- held text -------------------------------------------------------- #
-    def _resolve(self, final: bool):
-        """Decide a held span. Returns released text, or None to wait."""
+    def _resolve(self, final: bool) -> bool:
+        """Work on a held span. Returns False to wait for more input."""
         h = self._hold
         kind = h["kind"]
         if kind == "json":
             return self._resolve_json(h, final)
         if kind == "fence":
             return self._resolve_fence(h, final)
+        tag = h["tag"]
+        if tag in _THINK:
+            if self.shown.strip() or self.calls:
+                # Reasoning opens a reply; a <think> in the middle of an answer
+                # is the answer talking *about* the tag.
+                self._tags_are_text = True
+                return self._release(h["start"] + len(tag))
+            return self._resolve_think(h, final)
+        if tag in _BARE_CLOSE and self._tags_are_text:
+            # "...wrap thoughts in <think>...</think> tags": the close belongs
+            # to an open the answer already showed as text. Treating it as the
+            # end of hidden reasoning cut the answer and dropped its calls.
+            return self._release(h["start"] + len(tag))
+        if tag in _BARE_CLOSE:
+            # Reasoning that began in the prompt (the template opened <think>
+            # for the model): everything so far was thought, not answer, and
+            # any call found in it was only considered.
+            self.calls = []
+            self.answer_from = len(self.shown)
+            self._consume(h["start"] + len(tag))
+            return True
+        if tag == _RESULT:
+            if self.calls:
+                # Text mode: the model is inventing the tool's output. The
+                # real one is coming; nothing after this is worth showing.
+                self._stopped = True
+                self._hold = None
+                return True
+            return self._release(h["start"] + len(tag))
         return self._resolve_tag(h, final)
 
-    def _release(self, end: int) -> str:
+    def _release(self, end: int) -> bool:
         self._hold = None
-        return self._take(end)
+        self._take(end)
+        return True
 
     def _brackets(self, h: dict, start: int):
         """Index of the bracket that closes the value opening at `start`, or None.
@@ -415,14 +602,14 @@ class StreamFilter:
         st.update(i=i, depth=depth, quote=quote, esc=esc)
         return None
 
-    def _resolve_json(self, h: dict, final: bool):
+    def _resolve_json(self, h: dict, final: bool) -> bool:
         buf, o = self._buf, h["open"]
         if not h.get("plausible"):
             k = o + 1
             while k < len(buf) and buf[k] in " \t\r\n":
                 k += 1
             if k >= len(buf):
-                return self._release(len(buf)) if final else None
+                return self._release(len(buf)) if final else False
             # {"…  or  [{…  — anything else is prose that happens to start
             # with a bracket ("[1] see below", "{x | x > 0}") and goes now.
             if not ((buf[o] == "{" and buf[k] in "\"'") or (buf[o] == "[" and buf[k] == "{")):
@@ -431,31 +618,32 @@ class StreamFilter:
         end = self._brackets(h, o)
         if end is None:
             if not final:
-                return None
+                return False
             calls = calls_in(buf[o:], self.info)
             if calls:
                 self.calls += calls
                 self._consume(len(buf))
-                return ""
+                return True
             return self._release(len(buf))
         value = buf[o:end + 1]
         calls = calls_in(value, self.info)
         if calls:
             self.calls += calls
             self._consume(end + 1)
-            return ""
+            return True
         if not self.shown.strip():
             reply = reply_text(value)
             if reply is not None:
                 self._consume(end + 1)
-                return reply
+                self.shown += reply
+                return True
         return self._release(end + 1)
 
-    def _resolve_fence(self, h: dict, final: bool):
+    def _resolve_fence(self, h: dict, final: bool) -> bool:
         buf, f = self._buf, h["open"]
         nl = buf.find("\n", f)
         if nl < 0:
-            return self._release(len(buf)) if final else None
+            return self._release(len(buf)) if final else False
         if not h.get("plausible"):
             lang = buf[f + 3:nl].strip().lower()
             k = nl + 1
@@ -464,43 +652,85 @@ class StreamFilter:
             if lang in ("", "json", "json5", "jsonc"):
                 if k >= len(buf):
                     if not final:
-                        return None
+                        return False
                 elif buf[k] not in "{[":
                     lang = "code"
             if lang not in _CALL_LANGS:
                 self._in_code = True
                 return self._release(nl + 1)
             h["plausible"] = True
-        m = _CLOSE_FENCE.search(buf, nl + 1)
-        # "```" at the very end may still become "```json" — a closer has to
-        # finish its line before it counts.
-        if not final and (m is None or m.end() == len(buf)):
-            return None
-        body = buf[nl + 1:m.start() if m else len(buf)]
-        end = len(buf)
-        if m:
-            end = m.end() + (1 if buf[m.end():m.end() + 1] == "\n" else 0)
+        close = self._closing_fence(h, nl + 1, final)
+        if close is False:
+            return False
+        body = buf[nl + 1:close[0] if close else len(buf)]
+        end = close[1] if close else len(buf)
         calls = calls_in(body, self.info, strict=True)
         if calls:
             self.calls += calls
             self._consume(end)
-            return ""
+            return True
         return self._release(end)
 
-    def _resolve_tag(self, h: dict, final: bool):
+    def _closing_fence(self, h: dict, start: int, final: bool):
+        """(start, end) of the line that closes the fence; None if the reply
+        ended without one; False to wait.
+
+        Incremental: looks for "```" only in text it has not seen, so a call
+        written as one 200 KB line is scanned once, not once per delta.
+        """
+        buf = self._buf
+        k = h.get("fscan", start)
+        while True:
+            k = buf.find("```", k)
+            if k < 0:
+                h["fscan"] = max(start, len(buf) - 2)
+                return None if final else False
+            ls = buf.rfind("\n", 0, k) + 1
+            le = buf.find("\n", k)
+            if ls >= start and not buf[ls:k].strip(" \t"):
+                if le < 0 and not final:
+                    h["fscan"] = k          # "```" may still become "```json"
+                    return False
+                tail = buf[k + 3:le if le >= 0 else len(buf)]
+                if not tail.strip(" \t\r"):
+                    return ls, (le + 1 if le >= 0 else len(buf))
+            k += 3
+
+    def _resolve_think(self, h: dict, final: bool) -> bool:
+        """Stream reasoning out on the thinking channel as it arrives."""
+        buf, tag = self._buf, h["tag"]
+        close = "</" + tag[1:]
+        body = h.setdefault("body", h["start"] + len(tag))
+        c = buf.find(close, body)
+        if c < 0:
+            # keep back what could be the start of the closing tag
+            safe = len(buf) if final else max(body, len(buf) - len(close) + 1)
+            if safe > body:
+                self._thinking.append(buf[body:safe])
+                h["body"] = safe
+            if final:
+                self._consume(len(buf))
+                return True
+            return False
+        if c > body:
+            self._thinking.append(buf[body:c])
+        self._consume(c + len(close))
+        return True
+
+    def _resolve_tag(self, h: dict, final: bool) -> bool:
         buf, s, tag = self._buf, h["start"], h["tag"]
         body_at = s + len(tag)
         if tag in ("<tool_call>", "<function="):
             close = "</tool_call>" if tag == "<tool_call>" else "</function>"
-            c = buf.find(close, body_at)
+            c = buf.find(close, h.get("seen", body_at))
             if c < 0:
                 if not final:
-                    return None
+                    h["seen"] = max(body_at, len(buf) - len(close) + 1)
+                    return False
                 end = len(buf)
             else:
                 end = c + len(close)
-            span = buf[s:end]
-            calls = calls_in(span, self.info)
+            calls = calls_in(buf[s:end], self.info)
         else:
             # [TOOL_CALLS] / <|python_tag|> — a JSON value follows, or mistral's
             # newer `[TOOL_CALLS]name[ARGS]{...}`.
@@ -511,16 +741,14 @@ class StreamFilter:
             if k < len(buf) and buf[k] not in "{[":
                 a = buf.find("[ARGS]", k)
                 if a < 0:
-                    if not final:
-                        return None
-                    return self._release(len(buf))
+                    return self._release(len(buf)) if final else False
                 name, k = buf[k:a].strip(), a + len("[ARGS]")
             if k >= len(buf):
-                return self._release(len(buf)) if final else None
+                return self._release(len(buf)) if final else False
             end = self._brackets(h, k)
             if end is None:
                 if not final:
-                    return None
+                    return False
                 end = len(buf) - 1
             end += 1
             value = buf[k:end]
@@ -532,5 +760,5 @@ class StreamFilter:
         if calls:
             self.calls += calls
             self._consume(end)
-            return ""
+            return True
         return self._release(end)

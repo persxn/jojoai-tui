@@ -9,6 +9,7 @@ server's OTP endpoints exist you can also stash a demo access code with
 from __future__ import annotations
 
 import getpass
+import http.client
 import json
 import os
 import sys
@@ -37,50 +38,84 @@ def load_token(endpoint: str) -> str | None:
     return entry.get("token") if entry else None
 
 
-def save_token(endpoint: str, token: str, email: str | None = None) -> None:
+def _write_all(data: dict) -> None:
+    """Replace the credentials file atomically, private from the first byte.
+
+    It used to be truncated in place: an interrupted save (Ctrl-C, a full
+    disk) lost every saved token, not just the one being written."""
     path = creds_path()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    data = _load_all()
-    data[endpoint.rstrip("/")] = {"token": token, "email": email, "savedAt": int(time.time())}
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    d = os.path.dirname(path)
+    os.makedirs(d, exist_ok=True)
+    if os.name != "nt":
+        try:
+            os.chmod(d, 0o700)
+        except OSError:
+            pass
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
-    os.chmod(path, 0o600)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def save_token(endpoint: str, token: str, email: str | None = None) -> None:
+    data = _load_all()
+    data[endpoint.rstrip("/")] = {"token": token, "email": email, "savedAt": int(time.time())}
+    _write_all(data)
 
 
 def forget(endpoint: str) -> bool:
     data = _load_all()
     if data.pop(endpoint.rstrip("/"), None) is None:
         return False
-    fd = os.open(creds_path(), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+    _write_all(data)
     return True
 
 
-def _post(url: str, body: dict, timeout: int = 20) -> tuple[int, dict]:
-    # The agent matters: a default urllib one is banned at the edge (see net.py).
-    req = urllib.request.Request(
-        url, data=json.dumps(body).encode(), method="POST",
-        headers=_headers({"Content-Type": "application/json"}),
-    )
+def _json(raw: bytes) -> dict:
     try:
+        obj = json.loads(raw or b"{}")
+    except ValueError:
+        return {}           # a captive portal or proxy page, not our server
+    return obj if isinstance(obj, dict) else {}
+
+
+def _post(url: str, body: dict, timeout: int = 20) -> tuple[int, dict]:
+    """Every failure is a RuntimeError with a sentence in it — --login used to
+    end in a traceback on a timeout, a reset, or an HTML error page."""
+    try:
+        # The agent matters: a default urllib one is banned at the edge (see net.py).
+        req = urllib.request.Request(
+            url, data=json.dumps(body).encode(), method="POST",
+            headers=_headers({"Content-Type": "application/json"}),
+        )
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.status, json.loads(r.read() or b"{}")
+            return r.status, _json(r.read())
     except urllib.error.HTTPError as e:
         try:
-            return e.code, json.loads(e.read() or b"{}")
-        except ValueError:
+            return e.code, _json(e.read())
+        except (OSError, http.client.HTTPException):   # an error page cut short
             return e.code, {}
     except urllib.error.URLError as e:
-        raise RuntimeError(f"cannot reach {url}: {e.reason}")
+        raise RuntimeError(f"cannot reach {url}: {e.reason}") from e
+    except (OSError, http.client.HTTPException, ValueError) as e:
+        raise RuntimeError(f"cannot reach {url}: {e}") from e
 
 
 def otp_login(endpoint: str, email: str | None = None,
               code: str | None = None) -> str:
     """Interactive email + OTP. Returns a token and persists it."""
     endpoint = endpoint.rstrip("/")
-    email = email or input("email: ").strip()
+    try:
+        email = email or input("email: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        raise RuntimeError("login cancelled") from None
     if not email:
         raise RuntimeError("no email given")
 
@@ -91,7 +126,10 @@ def otp_login(endpoint: str, email: str | None = None,
         raise RuntimeError(f"otp request failed (HTTP {status})")
     print("a 6-digit code was sent if that address is registered.", file=sys.stderr)
 
-    otp = code or getpass.getpass("code: ").strip()
+    try:
+        otp = code or getpass.getpass("code: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        raise RuntimeError("login cancelled") from None
     status, data = _post(f"{endpoint}/api/auth/otp/verify", {"email": email, "code": otp})
     token = data.get("token")
     if status != 200 or not token:

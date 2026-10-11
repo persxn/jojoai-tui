@@ -15,14 +15,44 @@ def _crash_log_path() -> str:
     return os.path.join(base, "crash.log")
 
 
+def _remote_url(raw: str) -> str | None:
+    """`ai.jojocode.in`, `wss://ai.jojocode.in/` and `https://…` all mean the
+    same server. A bare host used to make the websocket dial 127.0.0.1:80, and
+    a ws(s):// URL broke login (which is plain HTTPS)."""
+    raw = raw.strip()
+    if "://" not in raw:
+        raw = "https://" + raw
+    scheme, _, rest = raw.partition("://")
+    rest = rest.rstrip("/")             # after the split: "https://" alone has no host
+    scheme = {"wss": "https", "ws": "http"}.get(scheme.lower(), scheme.lower())
+    if scheme not in ("http", "https") or not rest:
+        return None
+    host, slash, path = rest.partition("/")
+    return f"{scheme}://{host.lower()}{slash}{path}"
+
+
+def _console_ok() -> bool:
+    """Can curses drive this terminal? PDCurses needs a real Windows console:
+    under mintty (Git Bash), PowerShell ISE or redirected input it exits with
+    "Redirection is not supported." before drawing anything."""
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(
         prog="jojo",
         description="JojoCode AI TUI - a curses agentic coding assistant (local Ollama, or a remote server)",
     )
     ap.add_argument("task", nargs="*", help="run this task once and exit (headless)")
-    ap.add_argument("--model", help="Ollama model tag (default: settings.json, else gpt-oss:120b)")
-    ap.add_argument("--host", help="Ollama host URL")
+    ap.add_argument("--model", help="an Ollama tag, or the model id an OpenAI-compatible server "
+                                     "lists (default: settings.json, else gpt-oss:120b)")
+    ap.add_argument("--host", help="model server URL (Ollama, or any OpenAI-compatible "
+                                    "server ending in /v1); host:port is enough")
+    ap.add_argument("--api", choices=["auto", "ollama", "openai"],
+                    help="server protocol (default auto: openai when the host ends in /v1)")
     ap.add_argument("--cwd", help="working directory for tools")
     ap.add_argument("--ctx", type=int, help="context window (num_ctx)")
     ap.add_argument("--think", type=str.lower, choices=["off", "low", "medium", "high"],
@@ -55,14 +85,25 @@ def main(argv=None):
 
     ap.add_argument("--version", action="version", version=f"JojoCode AI TUI {__version__}")
     args = ap.parse_args(argv)
+    if (args.login or args.logout or args.code or args.email) and not args.remote:
+        ap.error("--login, --logout, --code and --email need --remote URL")
+
+    from .config import normalize_host
 
     cfg = Config()
     if args.model:
         cfg.model = args.model
     if args.host:
-        cfg.host = args.host
+        cfg.host = normalize_host(args.host)
+    if args.api:
+        cfg.api = args.api
     if args.cwd:
-        cfg.cwd = args.cwd
+        p = os.path.abspath(os.path.expanduser(os.path.expandvars(args.cwd.strip().strip('"'))))
+        if not os.path.isdir(p):
+            ap.error(f"--cwd: not a directory: {p}")
+        cfg.cwd = p
+        if not args.project:
+            cfg.project_label = os.path.basename(p.rstrip("\\/")) or "project"
     if args.ctx:
         cfg.num_ctx = args.ctx
     if args.think is not None:
@@ -80,7 +121,9 @@ def main(argv=None):
     if args.no_mouse:
         cfg.mouse = False
     if args.remote:
-        cfg.remote_endpoint = args.remote.rstrip("/")
+        cfg.remote_endpoint = _remote_url(args.remote)
+        if not cfg.remote_endpoint:
+            ap.error(f"--remote: not an http(s) URL: {args.remote}")
     if args.project:
         cfg.project_label = args.project
 
@@ -119,6 +162,11 @@ def main(argv=None):
             print("jojo: this terminal has no `curses` (Windows: pip install windows-curses)",
                   file=sys.stderr)
             return 2
+        if os.name == "nt" and not _console_ok():
+            print("jojo: this terminal is not a Windows console (Git Bash/mintty, ISE, or "
+                  "redirected input).\n  Use Windows Terminal or cmd, or: winpty jojo",
+                  file=sys.stderr)
+            return 2
 
         from .remote import RemoteAgent
         from .tui import run as run_tui
@@ -129,6 +177,12 @@ def main(argv=None):
     if one_shot is not None or args.headless:
         from .headless import run as run_headless
         return run_headless(cfg, one_shot)
+    if os.name == "nt" and not _console_ok():
+        sys.stderr.write("jojo: not a Windows console (Git Bash/mintty, ISE or redirected "
+                         "input) — starting the plain REPL instead. For the full TUI use "
+                         "Windows Terminal or cmd, or run: winpty jojo\n")
+        from .headless import run as run_headless
+        return run_headless(cfg, None)
 
     try:
         import curses  # noqa: F401

@@ -6,6 +6,12 @@ stdlib only (`socket`, `ssl`) so the TUI keeps zero runtime dependencies.
 
 Not a general-purpose library: no permessage-deflate, no huge (>2^32) frames,
 one message per frame on send.
+
+Behind a proxy (HTTPS_PROXY / the system proxy) the connection is tunnelled
+with CONNECT, as the login request already was by urllib — remote mode used to
+fail behind any proxy that login worked through. Once a frame has started
+arriving the socket has a read timeout, so a connection that dies half-way
+through a frame surfaces as WSClosed instead of hanging the turn for good.
 """
 
 from __future__ import annotations
@@ -19,11 +25,38 @@ import socket
 import ssl
 import struct
 import threading
+import urllib.parse
+import urllib.request
 from urllib.parse import urlparse
 
 from .net import headers as _headers
 
 _GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+READ_TIMEOUT = 60.0        # once a frame is under way, how long a silent socket is given
+
+
+def _mask(data: bytes, key: bytes) -> bytes:
+    """XOR with the 4-byte key — as one big integer, not byte by byte in Python."""
+    n = len(data)
+    if not n:
+        return b""
+    k = (key * (n // 4 + 1))[:n]
+    return (int.from_bytes(data, "big") ^ int.from_bytes(k, "big")).to_bytes(n, "big")
+
+
+def _proxy(scheme: str, host: str) -> str | None:
+    """The proxy this connection should go through, if any (same rules as urllib,
+    except that loopback is always direct — see transport.py)."""
+    from .transport import _is_loopback
+    if _is_loopback(host):
+        return None
+    try:
+        if urllib.request.proxy_bypass(host):
+            return None
+        proxies = urllib.request.getproxies()
+    except Exception:  # noqa: BLE001
+        return None
+    return proxies.get("https" if scheme == "wss" else "http")
 
 OP_CONT, OP_TEXT, OP_BIN, OP_CLOSE, OP_PING, OP_PONG = 0x0, 0x1, 0x2, 0x8, 0x9, 0xA
 
@@ -59,13 +92,19 @@ class WSClient:
     def connect(self) -> None:
         u = urlparse(self.url)
         secure = u.scheme == "wss"
-        host = u.hostname or "127.0.0.1"
+        if not u.hostname:
+            raise WSError(f"no host in {self.url!r}")
+        host = u.hostname
         port = u.port or (443 if secure else 80)
         path = u.path or "/"
         if u.query:
             path += "?" + u.query
 
-        raw = socket.create_connection((host, port), timeout=self.connect_timeout)
+        proxy = _proxy(u.scheme, host)
+        if proxy:
+            raw = self._tunnel(proxy, host, port)
+        else:
+            raw = socket.create_connection((host, port), timeout=self.connect_timeout)
         if secure:
             ctx = ssl.create_default_context()
             raw = ctx.wrap_socket(raw, server_hostname=host)
@@ -100,7 +139,28 @@ class WSClient:
         if accept.lower() not in header_blob.decode("latin1").lower():
             raise WSError("handshake failed: bad Sec-WebSocket-Accept")
         self._buf = rest
-        self._sock.settimeout(None)
+        self._sock.settimeout(READ_TIMEOUT)
+
+    def _tunnel(self, proxy: str, host: str, port: int) -> socket.socket:
+        p = urllib.parse.urlsplit(proxy if "://" in proxy else "http://" + proxy)
+        sock = socket.create_connection((p.hostname, p.port or 8080), timeout=self.connect_timeout)
+        lines = [f"CONNECT {host}:{port} HTTP/1.1", f"Host: {host}:{port}"]
+        if p.username:
+            cred = f"{urllib.parse.unquote(p.username)}:{urllib.parse.unquote(p.password or '')}"
+            lines.append("Proxy-Authorization: Basic " + base64.b64encode(cred.encode()).decode())
+        sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = sock.recv(4096)
+            if not chunk:
+                sock.close()
+                raise WSError("the proxy closed the connection")
+            head += chunk
+        status = head.split(b"\r\n", 1)[0].decode("latin1")
+        if " 200" not in status:
+            sock.close()
+            raise WSError(f"the proxy refused the tunnel: {status}")
+        return sock
 
     def close(self, code: int = 1000) -> None:
         if self._closed:
@@ -128,7 +188,7 @@ class WSClient:
             hdr = struct.pack(">BBH", fin_op, 0x80 | 126, n)
         else:
             hdr = struct.pack(">BBQ", fin_op, 0x80 | 127, n)
-        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        masked = _mask(payload, mask)
         with self._send_lock:
             try:
                 self._sock.sendall(hdr + mask + masked)
@@ -157,10 +217,12 @@ class WSClient:
             (length,) = struct.unpack(">H", self._recv_exact(2))
         elif length == 127:
             (length,) = struct.unpack(">Q", self._recv_exact(8))
+        # servers must not mask; tolerate it anyway — the key comes before the
+        # payload, not inside it (reading it as payload desynced the stream)
+        mk = self._recv_exact(4) if masked else None
         payload = self._recv_exact(length) if length else b""
-        if masked:  # servers must not mask; tolerate anyway
-            mk = payload[:4]
-            payload = bytes(c ^ mk[i % 4] for i, c in enumerate(payload[4:]))
+        if mk:
+            payload = _mask(payload, mk)
         return opcode, fin, payload
 
     # -- public messaging -------------------------------------------- #
@@ -175,7 +237,9 @@ class WSClient:
         """
         if self._sock is None:
             raise WSClosed()
-        if timeout is not None and not self._buf:
+        pending = getattr(self._sock, "pending", None)
+        if timeout is not None and not self._buf and not (pending and pending()):
+            # (TLS may already hold decrypted bytes the socket will never signal)
             sel = selectors.DefaultSelector()
             sel.register(self._sock, selectors.EVENT_READ)
             ready = sel.select(timeout)
@@ -184,7 +248,6 @@ class WSClient:
                 return None
 
         data = b""
-        op_first = None
         while True:
             opcode, fin, payload = self._read_frame()
             if opcode == OP_PING:
@@ -197,7 +260,6 @@ class WSClient:
                 self._closed = True
                 raise WSClosed(code, payload[2:].decode("utf-8", "replace"))
             if opcode in (OP_TEXT, OP_BIN):
-                op_first = opcode
                 data = payload
             elif opcode == OP_CONT:
                 data += payload

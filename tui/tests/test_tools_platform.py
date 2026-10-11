@@ -157,7 +157,8 @@ def test_timeout_in_milliseconds_is_capped(ctx, monkeypatch):
     # 120000 "seconds" from a model that meant milliseconds must not let one
     # hung command hold the agent for a day and a half
     seen = []
-    monkeypatch.setattr(tools.shell, "run", lambda cmd, cwd, t: seen.append(t) or ("", "", 0, False))
+    monkeypatch.setattr(tools.shell, "run",
+                        lambda cmd, cwd, t, cancel=None: seen.append(t) or tools.shell.Result("", "", 0))
     run_tool("run_bash", {"command": "true", "timeout": "120000"}, ctx)
     run_tool("run_bash", {"command": "true", "timeout": None}, ctx)
     assert seen == [3600, 120]
@@ -169,10 +170,10 @@ def test_timeout_in_milliseconds_is_capped(ctx, monkeypatch):
 def test_search_never_reads_chat_history(ctx, tmp_path, monkeypatch, with_rg):
     import shutil
 
-    if with_rg and not shutil.which("rg"):
+    if with_rg and not tools._which_rg():
         pytest.skip("ripgrep not installed")
     if not with_rg:
-        monkeypatch.setattr(shutil, "which", lambda name: None)
+        monkeypatch.setattr(tools, "_which_rg", lambda: None)
     data = tmp_path / "data" / "sessions"
     data.mkdir(parents=True)
     (data / "old.jsonl").write_text('{"content": "PINEAPPLE secret"}\n', encoding="utf-8")

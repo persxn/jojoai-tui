@@ -9,11 +9,16 @@ from __future__ import annotations
 
 import curses
 import math
+import sys
 
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 BARS = "▁▂▃▄▅▆▇█"
 
 A_ITALIC = getattr(curses, "A_ITALIC", 0)
+# PDCurses (windows-curses) renders A_BOLD on a colour pair as "colour + 8":
+# with the custom palette that is a different colour altogether, which turned
+# the jojo label and the thinking header violet. Colour does the work there.
+_BOLD = 0 if sys.platform == "win32" else curses.A_BOLD
 
 # dark forest -> bright green -> pale mint  (Tailwind green 900..200), 0-255
 _STOPS = [
@@ -87,7 +92,6 @@ class Theme:
                 pass
             self.grad.append(pid)
 
-        deep = (_CBASE + 1) if can else curses.COLOR_GREEN
         mid = (_CBASE + 3) if can else curses.COLOR_GREEN
         bright = (_CBASE + 5) if can else curses.COLOR_GREEN
         mint = (_CBASE + 7) if can else curses.COLOR_GREEN
@@ -134,23 +138,23 @@ class Theme:
         cp_caret = mk(mint)
 
         self.A = {
-            "assist": cp_assist | curses.A_BOLD,
-            "assist_label": cp_label | curses.A_BOLD,
-            "user": cp_user | curses.A_BOLD,
+            "assist": cp_assist | _BOLD,
+            "assist_label": cp_label | _BOLD,
+            "user": cp_user | _BOLD,
             "think": cp_think | A_ITALIC,
-            "think_gut": cp_think_gut | curses.A_BOLD,
-            "think_hdr": cp_think_hdr | curses.A_BOLD,
-            "tool": cp_tool | curses.A_BOLD,
+            "think_gut": cp_think_gut | _BOLD,
+            "think_hdr": cp_think_hdr | _BOLD,
+            "tool": cp_tool | _BOLD,
             "out": cp_out,
             "info": cp_info,
-            "error": cp_err | curses.A_BOLD,
+            "error": cp_err | _BOLD,
             "rule": cp_rule,
-            "status": cp_status | curses.A_BOLD,
-            "prompt": cp_prompt | curses.A_BOLD,
+            "status": cp_status | _BOLD,
+            "prompt": cp_prompt | _BOLD,
             "hint": cp_rule | curses.A_DIM,
-            "wordmark": cp_word | curses.A_BOLD,
-            "caret": cp_caret | curses.A_BOLD,
-            "accent": cp_think_gut | curses.A_BOLD,
+            "wordmark": cp_word | _BOLD,
+            "caret": cp_caret | _BOLD,
+            "accent": cp_think_gut | _BOLD,
         }
 
     # ------------------------------------------------------------------ #
@@ -177,7 +181,7 @@ class Theme:
         for i in range(width):
             try:
                 win.addstr(y, x0 + i, ch,
-                           self._pair_at(i / max(1, width - 1)) | curses.A_BOLD)
+                           self._pair_at(i / max(1, width - 1)) | _BOLD)
             except curses.error:
                 pass
 
@@ -193,12 +197,12 @@ class Theme:
             f = 0.5 + 0.5 * math.sin(i / 7.0 - phase)
             try:
                 win.addstr(y, x0 + i, ch,
-                           curses.color_pair(self.grad[int(f * (n - 1))]) | curses.A_BOLD)
+                           curses.color_pair(self.grad[int(f * (n - 1))]) | _BOLD)
             except curses.error:
                 pass
 
     def gradient_text(self, win, y: int, x0: int, text: str,
-                      extra: int = curses.A_BOLD):
+                      extra: int = _BOLD):
         """Draw text with each character stepped along the gradient."""
         n = len(text)
         if not self.grad:
@@ -214,7 +218,7 @@ class Theme:
                 pass
 
     def shimmer_text(self, win, y: int, x0: int, text: str, phase: float = 0.0,
-                     extra: int = curses.A_BOLD):
+                     extra: int = _BOLD):
         """gradient_text with a bright highlight band that slides along `phase`."""
         n = len(text)
         if not self.grad or n == 0:
@@ -223,7 +227,7 @@ class Theme:
         head = (phase * 2.4) % (n + 8) - 4
         for i, cch in enumerate(text):
             if abs(i - head) < 2.2:
-                gid, a = self.grad[top], extra | curses.A_BOLD
+                gid, a = self.grad[top], extra | _BOLD
             else:
                 gid = self._grad_id(i / max(1, n - 1))
                 a = extra
@@ -247,7 +251,7 @@ class Theme:
                 else:
                     frac = (r / max(1, h - 1)) * 0.55 + (c / max(1, w - 1)) * 0.45
                     gid = self.grad[top] if abs(c - head) < 2.0 else self._grad_id(frac)
-                    attr = curses.color_pair(gid) | curses.A_BOLD
+                    attr = curses.color_pair(gid) | _BOLD
                 try:
                     win.addstr(y0 + r, x0 + c, ch, attr)
                 except curses.error:

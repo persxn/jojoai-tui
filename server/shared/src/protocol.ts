@@ -135,7 +135,8 @@ export interface ReplayEndMsg {
 export interface TurnDoneMsg {
   t: 'turn_done';
   usage: { tokensIn: number; tokensOut: number; modelMs: number; toolCalls: number };
-  stopReason: 'model_done' | 'max_turns' | 'max_wallclock' | 'interrupted' | 'error';
+  /** `max_tokens`: the model's reply hit its length limit (Ollama `done_reason: length`). */
+  stopReason: 'model_done' | 'max_tokens' | 'max_turns' | 'max_wallclock' | 'interrupted' | 'error';
 }
 
 export interface ErrorMsg {
